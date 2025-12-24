@@ -89,7 +89,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (修復版：移除 Session，增加延遲)
+# 3. 畫圖功能 (Yahoo + TWSE 官方救援)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -98,39 +98,75 @@ def get_yahoo_ticker_code(stock_id):
         if twstock.codes[clean_id].market == '上櫃': suffix = '.TWO'
     return f"{clean_id}{suffix}"
 
+# [新增] TWSE 官方資料救援 (針對 Yahoo 擋 IP)
+def fetch_twse_data(stock_id):
+    try:
+        # 抓取最近一個月的日成交資訊
+        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        
+        if data.get('stat') == 'OK':
+            raw = data['data']
+            df = pd.DataFrame(raw, columns=['Date', 'Volume', 'Turnover', 'Open', 'High', 'Low', 'Close', 'Change', 'Trans'])
+            
+            # 民國年轉西元
+            def convert_date(d):
+                parts = d.split('/')
+                return f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
+            
+            df['Date'] = df['Date'].apply(convert_date)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            
+            # 數值轉換 (移除逗號)
+            for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', ''), errors='coerce')
+            
+            # 簡單計算 MA
+            for m in [5, 10, 20]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+            return df
+    except: pass
+    return pd.DataFrame()
+
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     df = pd.DataFrame()
     last_error = None
 
-    # [Fix] 簡單暴力重試迴圈
-    for i in range(3): # 重試 3 次
+    # --- 步驟 1: 嘗試 Yahoo (最多試 3 次) ---
+    for i in range(3): 
         try:
-            # [Fix] 移除 session 參數，讓 yfinance 自動處理 (它會自動用 curl_cffi)
-            # [Fix] 關閉 threads 避免併發過快
+            # 使用最單純的 download，不加 session，關閉 thread
             data = yf.download(ticker_code, period="3mo", auto_adjust=False, progress=False, threads=False)
             
-            # 如果主要代號沒資料，嘗試切換市場 (.TW <-> .TWO)
+            # 如果主要代號沒資料，換個市場試試 (.TW <-> .TWO)
             if data.empty and ".TW" in ticker_code:
-                alt_ticker = ticker_code.replace(".TW", ".TWO")
-                data = yf.download(alt_ticker, period="3mo", auto_adjust=False, progress=False, threads=False)
+                data = yf.download(ticker_code.replace(".TW", ".TWO"), period="3mo", auto_adjust=False, progress=False, threads=False)
 
             if not data.empty:
                 df = data
-                break # 成功就跳出
+                break 
         except Exception as e:
             last_error = e
         
-        # [Fix] 這裡就是您要的：增加延遲，讓它慢慢爬
-        time.sleep(1.5 * (i + 1))
+        time.sleep(1) # 延遲 1 秒
 
-    # 資料處理
+    # --- 步驟 2: 如果 Yahoo 失敗，切換 TWSE 官方救援 ---
+    if df.empty:
+        # st.caption("Yahoo 無回應，嘗試切換 TWSE 官方資料...")
+        df = fetch_twse_data(stock_id)
+
+    # --- 資料後處理 ---
     if not df.empty:
         try:
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            df = df.reset_index()
             
+            # 處理 MultiIndex (新版 yfinance)
+            if isinstance(df.columns, pd.MultiIndex): 
+                df.columns = df.columns.get_level_values(0)
+            
+            df = df.reset_index()
             col_map = {}
             for c in df.columns:
                 c_s = str(c).lower()
@@ -145,26 +181,19 @@ def fetch_chart_data(stock_id):
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df.set_index('Date', inplace=True)
-                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+                
+                # 確保是數值
+                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                # 補算 MA (如果來源沒給)
+                for m in [5, 10, 20, 60]: 
+                    if f'MA{m}' not in df.columns:
+                        df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
         except: pass
 
-    # --- 救援模式：Twstock (如果 Yahoo 失敗) ---
-    if df.empty:
-        try:
-            ts = twstock.Stock(stock_id)
-            raw_data = ts.fetch_31()
-            if raw_data:
-                df = pd.DataFrame(raw_data)
-                df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'capacity': 'Volume'}, inplace=True)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df.set_index('Date', inplace=True)
-                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
-                return df
-        except Exception as e:
-            if not last_error: last_error = e
-
-    # 顯示錯誤
+    # 如果還是空的，這次不再隱藏錯誤
     if df.empty:
         err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "無資料"
         st.error(f"❌ 抓取失敗: {err_msg}")
