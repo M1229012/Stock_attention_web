@@ -89,7 +89,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (雙重保險版：Yahoo -> Twstock)
+# 3. 畫圖功能 (Yahoo Debug 強力修復版)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -99,29 +99,59 @@ def get_yahoo_ticker_code(stock_id):
     return f"{clean_id}{suffix}"
 
 def fetch_chart_data(stock_id):
-    # --- 方法 A: 嘗試 Yahoo Finance ---
     ticker_code = get_yahoo_ticker_code(stock_id)
+    
+    # 建立偽裝 Session
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
 
     df = pd.DataFrame()
-    try:
-        # 下載最近 3 個月
-        df = yf.download(ticker_code, period="3mo", auto_adjust=False, session=session, progress=False)
-        if df.empty and ".TW" in ticker_code:
-            df = yf.download(ticker_code.replace(".TW", ".TWO"), period="3mo", auto_adjust=False, session=session, progress=False)
+    last_error = None
+
+    # [Fix] 定義下載重試邏輯 (包含 session/no-session 雙路徑)
+    def attempt_download(target_code):
+        inner_err = None
+        for i in range(3): # Retry 3 times
+            try:
+                # Path A: 帶 Session (防擋)
+                try:
+                    data = yf.download(target_code, period="3mo", auto_adjust=False, session=session, progress=False)
+                except TypeError:
+                    # Path B: 不帶 Session (舊版兼容)
+                    data = yf.download(target_code, period="3mo", auto_adjust=False, progress=False)
+                
+                if not data.empty:
+                    return data, None
+            except Exception as e:
+                inner_err = e
+            
+            # Backoff: 降頻避免 429
+            time.sleep(1.5 * (i + 1))
         
-        if not df.empty:
+        return pd.DataFrame(), inner_err
+
+    # 1. 嘗試主要代號 (如 2330.TW)
+    df, last_error = attempt_download(ticker_code)
+
+    # 2. 如果失敗，嘗試切換市場 (如 2330.TWO)
+    if df.empty and ".TW" in ticker_code:
+        alt_ticker = ticker_code.replace(".TW", ".TWO")
+        df, last_error = attempt_download(alt_ticker)
+
+    # 資料處理
+    if not df.empty:
+        try:
             try: df.index = df.index.tz_localize(None)
             except: pass
-            
+
             if isinstance(df.columns, pd.MultiIndex):
                 try: df.columns = df.columns.get_level_values(0)
                 except: pass
-            
+
             df = df.reset_index()
+            
             col_map = {}
             for c in df.columns:
                 c_str = str(c).lower()
@@ -131,45 +161,45 @@ def fetch_chart_data(stock_id):
                 elif 'low' in c_str: col_map[c] = 'Low'
                 elif 'close' in c_str: col_map[c] = 'Close'
                 elif 'volume' in c_str: col_map[c] = 'Volume'
+            
             df = df.rename(columns=col_map)
+
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df.set_index('Date', inplace=True)
-    except: pass
+                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+                return df
+        except Exception as e:
+            last_error = e # 捕捉處理過程的錯誤
 
-    # --- 方法 B: 如果 Yahoo 失敗，使用 Twstock (救援模式) ---
+    # --- 3. 救援模式：Twstock (如果 Yahoo 全滅) ---
     if df.empty:
         try:
-            # Twstock 直接從證交所抓取，較不容易被擋
             ts = twstock.Stock(stock_id)
-            # 抓取最近 31 天 (受限於 twstock 庫存資料)
             raw_data = ts.fetch_31()
-            
             if raw_data:
                 df = pd.DataFrame(raw_data)
-                # 欄位轉換
                 df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'capacity': 'Volume'}, inplace=True)
                 df['Date'] = pd.to_datetime(df['Date'])
                 df.set_index('Date', inplace=True)
-        except: pass
+                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+                return df
+        except Exception as e:
+            # 如果連 Twstock 都掛了，保留 Yahoo 的錯誤訊息
+            pass
 
-    # --- 資料後處理 (計算 MA) ---
-    if not df.empty:
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        for m in [5, 10, 20, 60]: 
-            df[f'MA{m}'] = df['Close'].rolling(m).mean()
-        
-        return df
-
+    # [Fix] 如果全部失敗，印出具體錯誤 (不要 Pass)
+    if df.empty and last_error:
+        st.error(f"❌ K 線圖抓取失敗 (Yahoo/Twstock): {type(last_error).__name__}: {last_error}")
+    
     return pd.DataFrame()
 
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
     if df.empty: 
-        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo/Twstock 皆無回應)")
+        # 這裡不顯示 Warning，因為上方 fetch_chart_data 已經會顯示具體 Error
         return
 
     df.index = df.index.strftime('%Y-%m-%d')
