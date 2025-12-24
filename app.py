@@ -11,6 +11,7 @@ import gspread
 import requests
 import re
 import urllib3
+import time
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
@@ -88,7 +89,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (Yahoo Session 修復版)
+# 3. 畫圖功能 (強力修復版)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -99,49 +100,77 @@ def get_yahoo_ticker_code(stock_id):
 
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
-    try:
-        # [Fix] 建立一個偽裝成 Chrome 瀏覽器的 Session
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
+    
+    # 建立偽裝 Session
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive"
+    })
 
-        # [Fix] 將 Session 傳入 yf.Ticker，解決被擋 IP 的問題
-        ticker = yf.Ticker(ticker_code, session=session)
-        df = ticker.history(period="3mo", auto_adjust=False)
+    try:
+        # [Fix] 改用 yf.download 並強制指定 session，這是目前繞過 Yahoo 擋 IP 最有效的方法
+        # 嘗試下載 .TW
+        df = yf.download(ticker_code, period="3mo", auto_adjust=False, session=session, progress=False)
         
-        # 如果抓不到，嘗試切換市場代碼 (.TW <-> .TWO)
-        if df.empty and ".TW" in ticker_code: 
-             ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"), session=session)
-             df = ticker.history(period="3mo", auto_adjust=False)
+        # 如果抓不到且是空資料，嘗試切換到 .TWO
+        if df.empty and ".TW" in ticker_code:
+            alt_ticker = ticker_code.replace(".TW", ".TWO")
+            df = yf.download(alt_ticker, period="3mo", auto_adjust=False, session=session, progress=False)
         
         if not df.empty:
-            # 強制移除時區，防止 Plotly 報錯
+            # [Fix] 資料清理：移除時區
             try:
                 df.index = df.index.tz_localize(None)
             except: pass
 
+            # [Fix] 處理 MultiIndex Column (新版 yfinance 可能會回傳多層欄位)
+            if isinstance(df.columns, pd.MultiIndex):
+                try:
+                    df.columns = df.columns.get_level_values(0)
+                except: pass
+
             df = df.reset_index()
             
-            # 確保日期欄位名稱正確
-            if 'Date' not in df.columns:
-                if 'Datetime' in df.columns:
-                    df = df.rename(columns={'Datetime': 'Date'})
-                else:
-                    df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
-
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
+            # [Fix] 欄位名稱正規化
+            col_map = {}
+            for c in df.columns:
+                c_str = str(c).lower()
+                if 'date' in c_str or 'time' in c_str: col_map[c] = 'Date'
+                elif 'open' in c_str: col_map[c] = 'Open'
+                elif 'high' in c_str: col_map[c] = 'High'
+                elif 'low' in c_str: col_map[c] = 'Low'
+                elif 'close' in c_str: col_map[c] = 'Close'
+                elif 'volume' in c_str: col_map[c] = 'Volume'
             
-            for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
-            return df
-    except: pass
+            df = df.rename(columns=col_map)
+
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df.set_index('Date', inplace=True)
+                
+                # 確保數值型態
+                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                # 計算 MA
+                for m in [5, 10, 20, 60]: 
+                    df[f'MA{m}'] = df['Close'].rolling(m).mean()
+                
+                return df
+    except Exception as e:
+        # 這裡不印出錯誤，直接回傳空 DataFrame 交給 UI 處理
+        pass
+        
     return pd.DataFrame()
 
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
     if df.empty: 
-        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo 來源無回應)")
+        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo 來源無回應或IP受限)")
         return
 
     df.index = df.index.strftime('%Y-%m-%d')
