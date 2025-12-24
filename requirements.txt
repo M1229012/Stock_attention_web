@@ -7,3 +7,5 @@ twstock
 gspread
 google-auth
 urllib3
+requests
+lxml
