@@ -89,7 +89,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (Yahoo Debug 強力修復版)
+# 3. 畫圖功能 (修復：移除衝突的 Session)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -101,41 +101,33 @@ def get_yahoo_ticker_code(stock_id):
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     
-    # 建立偽裝 Session
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
+    # [Fix] 這裡不再手動建立 Session，因為新版 yfinance 會自己處理
+    # 如果手動傳入 requests.Session 會導致 YFDataException 崩潰
 
     df = pd.DataFrame()
     last_error = None
 
-    # [Fix] 定義下載重試邏輯 (包含 session/no-session 雙路徑)
+    # 定義下載邏輯
     def attempt_download(target_code):
         inner_err = None
-        for i in range(3): # Retry 3 times
+        for i in range(3): # 重試 3 次
             try:
-                # Path A: 帶 Session (防擋)
-                try:
-                    data = yf.download(target_code, period="3mo", auto_adjust=False, session=session, progress=False)
-                except TypeError:
-                    # Path B: 不帶 Session (舊版兼容)
-                    data = yf.download(target_code, period="3mo", auto_adjust=False, progress=False)
+                # [Fix] 關鍵：移除 session 參數，讓 yfinance 使用預設 (可能是 curl_cffi)
+                data = yf.download(target_code, period="3mo", auto_adjust=False, progress=False)
                 
                 if not data.empty:
                     return data, None
             except Exception as e:
                 inner_err = e
             
-            # Backoff: 降頻避免 429
-            time.sleep(1.5 * (i + 1))
+            time.sleep(1) # 稍作休息避免 429
         
         return pd.DataFrame(), inner_err
 
-    # 1. 嘗試主要代號 (如 2330.TW)
+    # 1. 嘗試主要代號
     df, last_error = attempt_download(ticker_code)
 
-    # 2. 如果失敗，嘗試切換市場 (如 2330.TWO)
+    # 2. 如果失敗，嘗試切換市場
     if df.empty and ".TW" in ticker_code:
         alt_ticker = ticker_code.replace(".TW", ".TWO")
         df, last_error = attempt_download(alt_ticker)
@@ -172,7 +164,7 @@ def fetch_chart_data(stock_id):
                 for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
         except Exception as e:
-            last_error = e # 捕捉處理過程的錯誤
+            last_error = e
 
     # --- 3. 救援模式：Twstock (如果 Yahoo 全滅) ---
     if df.empty:
@@ -187,20 +179,18 @@ def fetch_chart_data(stock_id):
                 for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
         except Exception as e:
-            # 如果連 Twstock 都掛了，保留 Yahoo 的錯誤訊息
             pass
 
-    # [Fix] 如果全部失敗，印出具體錯誤 (不要 Pass)
-    if df.empty and last_error:
-        st.error(f"❌ K 線圖抓取失敗 (Yahoo/Twstock): {type(last_error).__name__}: {last_error}")
+    # 顯示具體錯誤，不再隱藏
+    if df.empty:
+        err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "無回傳資料"
+        st.error(f"❌ K 線圖抓取失敗 (Yahoo/Twstock): {err_msg}")
     
     return pd.DataFrame()
 
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
-    if df.empty: 
-        # 這裡不顯示 Warning，因為上方 fetch_chart_data 已經會顯示具體 Error
-        return
+    if df.empty: return
 
     df.index = df.index.strftime('%Y-%m-%d')
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
