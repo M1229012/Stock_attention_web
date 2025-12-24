@@ -48,13 +48,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 資料讀取 (修正版：優先讀取實體檔案，解決 Zeabur 報錯)
+# 2. 資料讀取 (雙模組：優先讀檔)
 # ==========================================
 @st.cache_data(ttl=30) 
 def fetch_data_from_sheet():
     try:
         gc = None
-        # --- 修改開始：優先檢查實體檔案 (Zeabur / Local) ---
         # 1. 檢查 Zeabur 的絕對路徑
         if os.path.exists("/service_key.json"):
             gc = gspread.service_account(filename="/service_key.json")
@@ -63,7 +62,7 @@ def fetch_data_from_sheet():
         elif os.path.exists("service_key.json"):
             gc = gspread.service_account(filename="service_key.json")
             
-        # 3. 如果檔案都沒有，才嘗試讀取 Streamlit Cloud 的 Secrets
+        # 3. Streamlit Cloud Secrets
         else:
             try:
                 if "gcp_service_account" in st.secrets:
@@ -74,12 +73,11 @@ def fetch_data_from_sheet():
                     )
                     gc = gspread.authorize(creds)
             except:
-                pass # 忽略 secrets 錯誤，繼續往下
+                pass 
         
         if gc is None:
             st.error("⚠️ 找不到憑證 (請確認 Zeabur Config File 或 service_key.json 是否存在)")
             return pd.DataFrame()
-        # --- 修改結束 ---
 
         sh = gc.open_by_url(GSHEET_URL)
         ws = sh.worksheet(GSHEET_WORKSHEET) 
@@ -96,7 +94,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (預警機用)
+# 3. 畫圖功能 (修正版：防止 0 錯誤)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -116,7 +114,11 @@ def fetch_chart_data(stock_id):
         
         if not df.empty:
             df = df.reset_index()
-            df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+            # [Fix] 增加時區判斷，避免報錯
+            df['Date'] = pd.to_datetime(df['Date'])
+            if df['Date'].dt.tz is not None:
+                df['Date'] = df['Date'].dt.tz_localize(None)
+            
             df.set_index('Date', inplace=True)
             for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
             return df
