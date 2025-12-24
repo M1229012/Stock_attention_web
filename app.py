@@ -15,6 +15,9 @@ import time
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
+# [Fix] 引入 curl_cffi 來模擬真實瀏覽器 (解決 Yahoo 擋 IP)
+from curl_cffi import requests as curl_requests
+
 # ==========================================
 # 忽略 SSL 警告
 # ==========================================
@@ -89,7 +92,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (修復：移除衝突的 Session)
+# 3. 畫圖功能 (curl_cffi 強力修復版)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -101,8 +104,9 @@ def get_yahoo_ticker_code(stock_id):
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     
-    # [Fix] 這裡不再手動建立 Session，因為新版 yfinance 會自己處理
-    # 如果手動傳入 requests.Session 會導致 YFDataException 崩潰
+    # [Fix] 使用 curl_cffi 建立 session，模擬 Chrome 瀏覽器
+    # 這是解決 Zeabur 上 Yahoo 阻擋的關鍵
+    session = curl_requests.Session(impersonate="chrome")
 
     df = pd.DataFrame()
     last_error = None
@@ -112,15 +116,15 @@ def fetch_chart_data(stock_id):
         inner_err = None
         for i in range(3): # 重試 3 次
             try:
-                # [Fix] 關鍵：移除 session 參數，讓 yfinance 使用預設 (可能是 curl_cffi)
-                data = yf.download(target_code, period="3mo", auto_adjust=False, progress=False)
+                # [Fix] 傳入 curl_cffi 的 session
+                data = yf.download(target_code, period="3mo", auto_adjust=False, session=session, progress=False)
                 
                 if not data.empty:
                     return data, None
             except Exception as e:
                 inner_err = e
             
-            time.sleep(1) # 稍作休息避免 429
+            time.sleep(1) # Backoff
         
         return pd.DataFrame(), inner_err
 
@@ -166,7 +170,7 @@ def fetch_chart_data(stock_id):
         except Exception as e:
             last_error = e
 
-    # --- 3. 救援模式：Twstock (如果 Yahoo 全滅) ---
+    # --- 3. 救援模式：Twstock ---
     if df.empty:
         try:
             ts = twstock.Stock(stock_id)
@@ -179,12 +183,13 @@ def fetch_chart_data(stock_id):
                 for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
         except Exception as e:
-            pass
+            # 如果 Twstock 也失敗，保留最後一個錯誤供顯示
+            if not last_error: last_error = e
 
-    # 顯示具體錯誤，不再隱藏
+    # [Fix] 顯式報錯：如果最後還是空的，把錯誤印出來
     if df.empty:
-        err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "無回傳資料"
-        st.error(f"❌ K 線圖抓取失敗 (Yahoo/Twstock): {err_msg}")
+        err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "Yahoo/Twstock 皆無回傳資料"
+        st.error(f"❌ K 線圖抓取失敗: {err_msg}")
     
     return pd.DataFrame()
 
