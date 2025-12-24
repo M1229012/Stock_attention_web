@@ -1,7 +1,7 @@
 streamlit
 pandas
 plotly
-yfinance>=0.2.30
+yfinance
 requests
 twstock
 gspread
