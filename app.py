@@ -14,7 +14,9 @@ import urllib3
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
-# 忽略 SSL 警告
+# ==========================================
+# 忽略 SSL 警告 (解決 Zeabur 連線失敗問題)
+# ==========================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =================設定區=================
@@ -46,30 +48,38 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 資料讀取 (雙模組：支援本地與雲端)
+# 2. 資料讀取 (修正版：優先讀取實體檔案，解決 Zeabur 報錯)
 # ==========================================
 @st.cache_data(ttl=30) 
 def fetch_data_from_sheet():
     try:
         gc = None
-        # A. 優先嘗試讀取雲端 Secrets (GitHub/Streamlit Cloud 用)
-        if "gcp_service_account" in st.secrets:
-            creds_dict = st.secrets["gcp_service_account"]
-            creds = Credentials.from_service_account_info(
-                creds_dict,
-                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-            )
-            gc = gspread.authorize(creds)
+        # --- 修改開始：優先檢查實體檔案 (Zeabur / Local) ---
+        # 1. 檢查 Zeabur 的絕對路徑
+        if os.path.exists("/service_key.json"):
+            gc = gspread.service_account(filename="/service_key.json")
         
-        # B. 如果沒有 Secrets，嘗試讀取本地檔案 (本地開發用)
+        # 2. 檢查本地開發的相對路徑
+        elif os.path.exists("service_key.json"):
+            gc = gspread.service_account(filename="service_key.json")
+            
+        # 3. 如果檔案都沒有，才嘗試讀取 Streamlit Cloud 的 Secrets
         else:
-            json_key_path = "service_key.json"
-            if os.path.exists(json_key_path):
-                gc = gspread.service_account(filename=json_key_path)
+            try:
+                if "gcp_service_account" in st.secrets:
+                    creds_dict = st.secrets["gcp_service_account"]
+                    creds = Credentials.from_service_account_info(
+                        creds_dict,
+                        scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+                    )
+                    gc = gspread.authorize(creds)
+            except:
+                pass # 忽略 secrets 錯誤，繼續往下
         
         if gc is None:
-            st.error("⚠️ 找不到憑證 (請設定 st.secrets 或提供 service_key.json)")
+            st.error("⚠️ 找不到憑證 (請確認 Zeabur Config File 或 service_key.json 是否存在)")
             return pd.DataFrame()
+        # --- 修改結束 ---
 
         sh = gc.open_by_url(GSHEET_URL)
         ws = sh.worksheet(GSHEET_WORKSHEET) 
@@ -365,7 +375,8 @@ def fetch_all_disposition_stocks():
     # 1. 上市
     try:
         url_twse = "https://openapi.twse.com.tw/v1/announcement/punish"
-        res = requests.get(url_twse, headers=headers, timeout=10)
+        # [Fix] 增加 verify=False 忽略 SSL
+        res = requests.get(url_twse, headers=headers, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
             for item in data:
@@ -391,7 +402,8 @@ def fetch_all_disposition_stocks():
     # 2. 上櫃
     try:
         url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
-        res = requests.get(url_tpex, headers=headers, timeout=10)
+        # [Fix] 增加 verify=False 忽略 SSL
+        res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
         data = res.json()
         
         tpex_data = []
