@@ -13,9 +13,10 @@ import re
 import urllib3
 import time
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from google.oauth2.service_account import Credentials
 
-# [Fix] 引入 curl_cffi 來模擬真實瀏覽器 (解決 Yahoo 擋 IP)
+# [Fix] 引入 curl_cffi 來模擬真實瀏覽器
 from curl_cffi import requests as curl_requests
 
 # ==========================================
@@ -92,7 +93,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (curl_cffi 強力修復版)
+# 3. 畫圖功能 (Yahoo 探測 + TWSE 備援)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -101,95 +102,145 @@ def get_yahoo_ticker_code(stock_id):
         if twstock.codes[clean_id].market == '上櫃': suffix = '.TWO'
     return f"{clean_id}{suffix}"
 
+# [新增] Yahoo 狀態探測器
+def yahoo_probe(symbol: str):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d"
+        # 使用 curl_requests 模擬 Chrome 進行探測
+        r = curl_requests.get(url, impersonate="chrome", timeout=5)
+        return r.status_code, r.text[:100] # 只回傳前100字避免log太長
+    except Exception as e:
+        return 999, str(e)
+
+# [新增] TWSE 官方備援 (上市股票專用)
+def fetch_twse_stock_day(stock_id: str, months: int = 3) -> pd.DataFrame:
+    rows = []
+    today = datetime.now()
+    try:
+        for k in range(months):
+            d = (today - relativedelta(months=k)).strftime("%Y%m01")
+            url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+            # 加上 User-Agent 避免被 TWSE 擋
+            r = requests.get(url, params={"response":"json","date":d,"stockNo":stock_id},
+                             timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+            j = r.json()
+            if j.get("stat") != "OK":
+                continue
+            if "data" in j:
+                for it in j["data"]:
+                    rows.append(it)
+        
+        if not rows: return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=[
+            "Date","Volume","Turnover","Open","High","Low","Close","Change","Transactions"
+        ])
+
+        # 民國年轉西元處理
+        def convert_roc_date(d_str):
+            try:
+                parts = d_str.split('/')
+                year = int(parts[0]) + 1911
+                return f"{year}-{parts[1]}-{parts[2]}"
+            except: return None
+
+        df["Date"] = df["Date"].apply(convert_roc_date)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        
+        # 數值轉換 (去除逗號)
+        for c in ["Open","High","Low","Close","Volume"]:
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",",""), errors="coerce")
+
+        df = df.dropna(subset=["Date"]).sort_values("Date")
+        df = df.set_index("Date")
+        
+        return df
+    except:
+        return pd.DataFrame()
+
+# [修復] 加入 Cache 與 雙路徑下載機制
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     
-    # [Fix] 使用 curl_cffi 建立 session，模擬 Chrome 瀏覽器
-    # 這是解決 Zeabur 上 Yahoo 阻擋的關鍵
-    session = curl_requests.Session(impersonate="chrome")
+    # 1. 探測 Yahoo 狀態 (顯示在 UI 上方便除錯)
+    status, preview = yahoo_probe(ticker_code)
+    if status != 200:
+        st.caption(f"⚠️ Yahoo Probe Error: {status} | {preview}")
 
+    # 建立偽裝 Session
+    session = curl_requests.Session(impersonate="chrome")
+    
     df = pd.DataFrame()
     last_error = None
 
-    # 定義下載邏輯
     def attempt_download(target_code):
-        inner_err = None
-        for i in range(3): # 重試 3 次
+        try:
+            # 路徑 A: 帶 Session (偽裝瀏覽器)
+            # threads=False 是關鍵，避免同時發送太多請求被封鎖
+            data = yf.download(target_code, period="3mo", auto_adjust=False, 
+                               session=session, progress=False, threads=False)
+            if not data.empty: return data, None
+        except Exception:
             try:
-                # [Fix] 傳入 curl_cffi 的 session
-                data = yf.download(target_code, period="3mo", auto_adjust=False, session=session, progress=False)
-                
-                if not data.empty:
-                    return data, None
+                # 路徑 B: 不帶 Session (舊版兼容模式)
+                data = yf.download(target_code, period="3mo", auto_adjust=False, 
+                                   progress=False, threads=False)
+                if not data.empty: return data, None
             except Exception as e:
-                inner_err = e
-            
-            time.sleep(1) # Backoff
+                return pd.DataFrame(), e
+        return pd.DataFrame(), None
+
+    # 開始嘗試下載 (Retry 機制)
+    for i in range(3):
+        df, last_error = attempt_download(ticker_code)
+        if not df.empty: break
         
-        return pd.DataFrame(), inner_err
+        # 如果主要代號失敗，嘗試切換市場 (.TW <-> .TWO)
+        if df.empty and ".TW" in ticker_code:
+            alt_ticker = ticker_code.replace(".TW", ".TWO")
+            df, last_error = attempt_download(alt_ticker)
+            if not df.empty: break
+        
+        time.sleep(1.5 * (i + 1)) # Backoff 降頻
 
-    # 1. 嘗試主要代號
-    df, last_error = attempt_download(ticker_code)
-
-    # 2. 如果失敗，嘗試切換市場
-    if df.empty and ".TW" in ticker_code:
-        alt_ticker = ticker_code.replace(".TW", ".TWO")
-        df, last_error = attempt_download(alt_ticker)
-
-    # 資料處理
+    # Yahoo 資料處理
     if not df.empty:
         try:
-            try: df.index = df.index.tz_localize(None)
-            except: pass
-
-            if isinstance(df.columns, pd.MultiIndex):
-                try: df.columns = df.columns.get_level_values(0)
-                except: pass
-
+            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df = df.reset_index()
             
             col_map = {}
             for c in df.columns:
-                c_str = str(c).lower()
-                if 'date' in c_str: col_map[c] = 'Date'
-                elif 'open' in c_str: col_map[c] = 'Open'
-                elif 'high' in c_str: col_map[c] = 'High'
-                elif 'low' in c_str: col_map[c] = 'Low'
-                elif 'close' in c_str: col_map[c] = 'Close'
-                elif 'volume' in c_str: col_map[c] = 'Volume'
-            
+                c_s = str(c).lower()
+                if 'date' in c_s: col_map[c]='Date'
+                elif 'open' in c_s: col_map[c]='Open'
+                elif 'high' in c_s: col_map[c]='High'
+                elif 'low' in c_s: col_map[c]='Low'
+                elif 'close' in c_s: col_map[c]='Close'
+                elif 'volume' in c_s: col_map[c]='Volume'
             df = df.rename(columns=col_map)
-
+            
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df.set_index('Date', inplace=True)
-                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
                 for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
-        except Exception as e:
-            last_error = e
+        except: pass
 
-    # --- 3. 救援模式：Twstock ---
+    # --- 最終救援：TWSE 官方資料 (若 Yahoo 失敗) ---
     if df.empty:
+        # st.caption("🔄 嘗試切換至 TWSE 官方資料源...")
         try:
-            ts = twstock.Stock(stock_id)
-            raw_data = ts.fetch_31()
-            if raw_data:
-                df = pd.DataFrame(raw_data)
-                df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'capacity': 'Volume'}, inplace=True)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df.set_index('Date', inplace=True)
-                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+            df = fetch_twse_stock_day(stock_id, months=3)
+            if not df.empty:
                 return df
-        except Exception as e:
-            # 如果 Twstock 也失敗，保留最後一個錯誤供顯示
-            if not last_error: last_error = e
+        except: pass
 
-    # [Fix] 顯式報錯：如果最後還是空的，把錯誤印出來
-    if df.empty:
-        err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "Yahoo/Twstock 皆無回傳資料"
-        st.error(f"❌ K 線圖抓取失敗: {err_msg}")
+    # 如果還是失敗，印出最後的錯誤
+    if df.empty and last_error:
+        st.error(f"❌ 抓取失敗: {type(last_error).__name__}: {last_error}")
     
     return pd.DataFrame()
 
