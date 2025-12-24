@@ -12,6 +12,7 @@ import requests
 import re
 import urllib3
 import time
+import random  # [Added] 用於隨機延遲
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
@@ -89,7 +90,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (Yahoo + TWSE 官方救援)
+# 3. 畫圖功能 (修正版：快取 + 退避重試 + 錯誤顯示)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -98,111 +99,63 @@ def get_yahoo_ticker_code(stock_id):
         if twstock.codes[clean_id].market == '上櫃': suffix = '.TWO'
     return f"{clean_id}{suffix}"
 
-# [新增] TWSE 官方資料救援 (針對 Yahoo 擋 IP)
-def fetch_twse_data(stock_id):
-    try:
-        # 抓取最近一個月的日成交資訊
-        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        
-        if data.get('stat') == 'OK':
-            raw = data['data']
-            df = pd.DataFrame(raw, columns=['Date', 'Volume', 'Turnover', 'Open', 'High', 'Low', 'Close', 'Change', 'Trans'])
-            
-            # 民國年轉西元
-            def convert_date(d):
-                parts = d.split('/')
-                return f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
-            
-            df['Date'] = df['Date'].apply(convert_date)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
-            
-            # 數值轉換 (移除逗號)
-            for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', ''), errors='coerce')
-            
-            # 簡單計算 MA
-            for m in [5, 10, 20]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
-            return df
-    except: pass
-    return pd.DataFrame()
-
+# [Fix] 加上快取，30分鐘內同一檔股票只抓一次，大幅減少請求
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
-    df = pd.DataFrame()
+
+    def _try(code):
+        # [Fix] 回歸最單純的 yf.Ticker，不塞 Session，避免與新版 yfinance 衝突
+        t = yf.Ticker(code)
+        df = t.history(period="3mo")
+        return df
+
     last_error = None
 
-    # --- 步驟 1: 嘗試 Yahoo (最多試 3 次) ---
-    for i in range(3): 
+    # [Fix] 退避重試機制 (Exponential Backoff)
+    for i in range(5): # 最多試 5 次
         try:
-            # 使用最單純的 download，不加 session，關閉 thread
-            data = yf.download(ticker_code, period="3mo", auto_adjust=False, progress=False, threads=False)
+            df = _try(ticker_code)
             
-            # 如果主要代號沒資料，換個市場試試 (.TW <-> .TWO)
-            if data.empty and ".TW" in ticker_code:
-                data = yf.download(ticker_code.replace(".TW", ".TWO"), period="3mo", auto_adjust=False, progress=False, threads=False)
+            # 如果 .TW 沒資料，嘗試 .TWO
+            if df.empty and ".TW" in ticker_code:
+                df = _try(ticker_code.replace(".TW", ".TWO"))
 
-            if not data.empty:
-                df = data
-                break 
-        except Exception as e:
-            last_error = e
-        
-        time.sleep(1) # 延遲 1 秒
-
-    # --- 步驟 2: 如果 Yahoo 失敗，切換 TWSE 官方救援 ---
-    if df.empty:
-        # st.caption("Yahoo 無回應，嘗試切換 TWSE 官方資料...")
-        df = fetch_twse_data(stock_id)
-
-    # --- 資料後處理 ---
-    if not df.empty:
-        try:
-            if df.index.tz is not None: df.index = df.index.tz_localize(None)
-            
-            # 處理 MultiIndex (新版 yfinance)
-            if isinstance(df.columns, pd.MultiIndex): 
-                df.columns = df.columns.get_level_values(0)
-            
-            df = df.reset_index()
-            col_map = {}
-            for c in df.columns:
-                c_s = str(c).lower()
-                if 'date' in c_s: col_map[c]='Date'
-                elif 'open' in c_s: col_map[c]='Open'
-                elif 'high' in c_s: col_map[c]='High'
-                elif 'low' in c_s: col_map[c]='Low'
-                elif 'close' in c_s: col_map[c]='Close'
-                elif 'volume' in c_s: col_map[c]='Volume'
-            df = df.rename(columns=col_map)
-            
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
+            if not df.empty:
+                # 資料清理標準流程
+                df = df.reset_index()
+                # 強制移除時區
+                try:
+                    df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+                except: pass
+                
                 df.set_index('Date', inplace=True)
                 
-                # 確保是數值
-                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                # 計算 MA
+                for m in [5, 10, 20, 60]:
+                    df[f"MA{m}"] = df['Close'].rolling(m).mean()
                 
-                # 補算 MA (如果來源沒給)
-                for m in [5, 10, 20, 60]: 
-                    if f'MA{m}' not in df.columns:
-                        df[f'MA{m}'] = df['Close'].rolling(m).mean()
                 return df
-        except: pass
 
-    # 如果還是空的，這次不再隱藏錯誤
-    if df.empty:
-        err_msg = f"{type(last_error).__name__}: {last_error}" if last_error else "無資料"
-        st.error(f"❌ 抓取失敗: {err_msg}")
-    
+        except Exception as e:
+            last_error = e
+            # [Optional] 如果想看 retry 過程可以打開這行，但通常不需要 spam 介面
+            # st.caption(f"Yahoo 重試中 ({i+1}/5)... {type(e).__name__}")
+
+        # [Fix] 失敗後等待時間指數增加 (1s, 2s, 4s, 8s...) + 隨機抖動
+        time.sleep((2 ** i) + random.random())
+
+    # 如果 5 次都失敗，顯示最後一次的錯誤
+    if last_error:
+        st.error(f"❌ K 線抓取失敗 (已重試5次): {type(last_error).__name__}: {last_error}")
+
     return pd.DataFrame()
 
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
-    if df.empty: return
+    if df.empty: 
+        # 上面已經有 st.error 了，這裡就不再顯示 warning
+        return
 
     df.index = df.index.strftime('%Y-%m-%d')
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
@@ -381,7 +334,14 @@ def render_risk_item(row):
             st.write(f"**PE**: {pe} | **PB**: {pb}")
         
         st.markdown("---")
-        plot_stock_analysis(stock_id, stock_name)
+        
+        # [Fix] 關鍵改動：改成按鈕觸發 (Lazy Loading)
+        # 預設不顯示，按了才去抓，避免一次 50 檔股票同時打 Yahoo 導致 IP 被鎖
+        show_k = st.toggle("📈 顯示 K 線圖 (點擊載入)", value=False, key=f"k_{stock_id}")
+        if show_k:
+            plot_stock_analysis(stock_id, stock_name)
+        else:
+            st.caption("點擊開關以載入 K 線圖 (節省流量避免封鎖)")
 
 # ==========================================
 # 5. 輔助函數 (處置中股票用)
