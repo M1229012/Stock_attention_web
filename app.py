@@ -88,7 +88,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (修復 K 線圖空白問題)
+# 3. 畫圖功能 (Yahoo Session 修復版)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -100,30 +100,34 @@ def get_yahoo_ticker_code(stock_id):
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     try:
-        ticker = yf.Ticker(ticker_code)
-        # [Fix] 統一使用 auto_adjust=False，避免格式混亂
+        # [Fix] 建立一個偽裝成 Chrome 瀏覽器的 Session
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+
+        # [Fix] 將 Session 傳入 yf.Ticker，解決被擋 IP 的問題
+        ticker = yf.Ticker(ticker_code, session=session)
         df = ticker.history(period="3mo", auto_adjust=False)
         
-        # [Fix] 如果 .TW 抓不到，嘗試 .TWO
+        # 如果抓不到，嘗試切換市場代碼 (.TW <-> .TWO)
         if df.empty and ".TW" in ticker_code: 
-             ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"))
+             ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"), session=session)
              df = ticker.history(period="3mo", auto_adjust=False)
         
         if not df.empty:
-            # [Fix] 強制移除 Index 的時區 (最穩健的做法，避免 .dt access 錯誤)
+            # 強制移除時區，防止 Plotly 報錯
             try:
                 df.index = df.index.tz_localize(None)
-            except:
-                pass # 如果已經沒有時區，就忽略
+            except: pass
 
             df = df.reset_index()
             
-            # [Fix] 確保日期欄位名稱為 'Date' (相容新舊版 yfinance)
+            # 確保日期欄位名稱正確
             if 'Date' not in df.columns:
                 if 'Datetime' in df.columns:
                     df = df.rename(columns={'Datetime': 'Date'})
                 else:
-                    # 萬一連名字都沒有，強制將第一欄改為 Date
                     df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
 
             df['Date'] = pd.to_datetime(df['Date'])
@@ -137,7 +141,7 @@ def fetch_chart_data(stock_id):
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
     if df.empty: 
-        st.warning("⚠️ 無法載入 K 線圖數據")
+        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo 來源無回應)")
         return
 
     df.index = df.index.strftime('%Y-%m-%d')
