@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+yfinance
+twstock
+gspread
+google-auth
+requests
