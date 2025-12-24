@@ -1,9 +1,9 @@
 streamlit
 pandas
 plotly
-yfinance
+yfinance>=0.2.30
+requests
 twstock
 gspread
 google-auth
-requests
-lxml
+urllib3
