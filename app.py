@@ -89,7 +89,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (強力修復版)
+# 3. 畫圖功能 (雙重保險版：Yahoo -> Twstock)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -99,78 +99,77 @@ def get_yahoo_ticker_code(stock_id):
     return f"{clean_id}{suffix}"
 
 def fetch_chart_data(stock_id):
+    # --- 方法 A: 嘗試 Yahoo Finance ---
     ticker_code = get_yahoo_ticker_code(stock_id)
-    
-    # 建立偽裝 Session
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "keep-alive"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
 
+    df = pd.DataFrame()
     try:
-        # [Fix] 改用 yf.download 並強制指定 session，這是目前繞過 Yahoo 擋 IP 最有效的方法
-        # 嘗試下載 .TW
+        # 下載最近 3 個月
         df = yf.download(ticker_code, period="3mo", auto_adjust=False, session=session, progress=False)
-        
-        # 如果抓不到且是空資料，嘗試切換到 .TWO
         if df.empty and ".TW" in ticker_code:
-            alt_ticker = ticker_code.replace(".TW", ".TWO")
-            df = yf.download(alt_ticker, period="3mo", auto_adjust=False, session=session, progress=False)
+            df = yf.download(ticker_code.replace(".TW", ".TWO"), period="3mo", auto_adjust=False, session=session, progress=False)
         
         if not df.empty:
-            # [Fix] 資料清理：移除時區
-            try:
-                df.index = df.index.tz_localize(None)
+            try: df.index = df.index.tz_localize(None)
             except: pass
-
-            # [Fix] 處理 MultiIndex Column (新版 yfinance 可能會回傳多層欄位)
-            if isinstance(df.columns, pd.MultiIndex):
-                try:
-                    df.columns = df.columns.get_level_values(0)
-                except: pass
-
-            df = df.reset_index()
             
-            # [Fix] 欄位名稱正規化
+            if isinstance(df.columns, pd.MultiIndex):
+                try: df.columns = df.columns.get_level_values(0)
+                except: pass
+            
+            df = df.reset_index()
             col_map = {}
             for c in df.columns:
                 c_str = str(c).lower()
-                if 'date' in c_str or 'time' in c_str: col_map[c] = 'Date'
+                if 'date' in c_str: col_map[c] = 'Date'
                 elif 'open' in c_str: col_map[c] = 'Open'
                 elif 'high' in c_str: col_map[c] = 'High'
                 elif 'low' in c_str: col_map[c] = 'Low'
                 elif 'close' in c_str: col_map[c] = 'Close'
                 elif 'volume' in c_str: col_map[c] = 'Volume'
-            
             df = df.rename(columns=col_map)
-
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df.set_index('Date', inplace=True)
-                
-                # 確保數值型態
-                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                # 計算 MA
-                for m in [5, 10, 20, 60]: 
-                    df[f'MA{m}'] = df['Close'].rolling(m).mean()
-                
-                return df
-    except Exception as e:
-        # 這裡不印出錯誤，直接回傳空 DataFrame 交給 UI 處理
-        pass
+    except: pass
+
+    # --- 方法 B: 如果 Yahoo 失敗，使用 Twstock (救援模式) ---
+    if df.empty:
+        try:
+            # Twstock 直接從證交所抓取，較不容易被擋
+            ts = twstock.Stock(stock_id)
+            # 抓取最近 31 天 (受限於 twstock 庫存資料)
+            raw_data = ts.fetch_31()
+            
+            if raw_data:
+                df = pd.DataFrame(raw_data)
+                # 欄位轉換
+                df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'capacity': 'Volume'}, inplace=True)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df.set_index('Date', inplace=True)
+        except: pass
+
+    # --- 資料後處理 (計算 MA) ---
+    if not df.empty:
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
+        for m in [5, 10, 20, 60]: 
+            df[f'MA{m}'] = df['Close'].rolling(m).mean()
+        
+        return df
+
     return pd.DataFrame()
 
 def plot_stock_analysis(stock_id, stock_name):
     df = fetch_chart_data(stock_id)
     if df.empty: 
-        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo 來源無回應或IP受限)")
+        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo/Twstock 皆無回應)")
         return
 
     df.index = df.index.strftime('%Y-%m-%d')
