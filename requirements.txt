@@ -9,3 +9,4 @@ google-auth
 urllib3
 requests
 lxml
+curl_cffi
