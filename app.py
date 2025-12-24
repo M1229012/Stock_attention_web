@@ -15,7 +15,7 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 忽略 SSL 警告 (解決 Zeabur 連線失敗問題)
+# 忽略 SSL 警告
 # ==========================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -48,21 +48,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 資料讀取 (雙模組：優先讀檔)
+# 2. 資料讀取
 # ==========================================
 @st.cache_data(ttl=30) 
 def fetch_data_from_sheet():
     try:
         gc = None
-        # 1. 檢查 Zeabur 的絕對路徑
         if os.path.exists("/service_key.json"):
             gc = gspread.service_account(filename="/service_key.json")
-        
-        # 2. 檢查本地開發的相對路徑
         elif os.path.exists("service_key.json"):
             gc = gspread.service_account(filename="service_key.json")
-            
-        # 3. Streamlit Cloud Secrets
         else:
             try:
                 if "gcp_service_account" in st.secrets:
@@ -72,8 +67,7 @@ def fetch_data_from_sheet():
                         scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
                     )
                     gc = gspread.authorize(creds)
-            except:
-                pass 
+            except: pass
         
         if gc is None:
             st.error("⚠️ 找不到憑證 (請確認 Zeabur Config File 或 service_key.json 是否存在)")
@@ -94,7 +88,7 @@ def fetch_data_from_sheet():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 畫圖功能 (修正版：防止 0 錯誤)
+# 3. 畫圖功能 (修復 K 線圖空白問題)
 # ==========================================
 def get_yahoo_ticker_code(stock_id):
     clean_id = str(stock_id).strip()
@@ -107,19 +101,34 @@ def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     try:
         ticker = yf.Ticker(ticker_code)
-        df = ticker.history(period="3mo")
+        # [Fix] 統一使用 auto_adjust=False，避免格式混亂
+        df = ticker.history(period="3mo", auto_adjust=False)
+        
+        # [Fix] 如果 .TW 抓不到，嘗試 .TWO
         if df.empty and ".TW" in ticker_code: 
              ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"))
-             df = ticker.history(period="3mo")
+             df = ticker.history(period="3mo", auto_adjust=False)
         
         if not df.empty:
+            # [Fix] 強制移除 Index 的時區 (最穩健的做法，避免 .dt access 錯誤)
+            try:
+                df.index = df.index.tz_localize(None)
+            except:
+                pass # 如果已經沒有時區，就忽略
+
             df = df.reset_index()
-            # [Fix] 增加時區判斷，避免報錯
-            df['Date'] = pd.to_datetime(df['Date'])
-            if df['Date'].dt.tz is not None:
-                df['Date'] = df['Date'].dt.tz_localize(None)
             
+            # [Fix] 確保日期欄位名稱為 'Date' (相容新舊版 yfinance)
+            if 'Date' not in df.columns:
+                if 'Datetime' in df.columns:
+                    df = df.rename(columns={'Datetime': 'Date'})
+                else:
+                    # 萬一連名字都沒有，強制將第一欄改為 Date
+                    df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
+
+            df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
+            
             for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
             return df
     except: pass
@@ -190,7 +199,6 @@ def render_risk_item(row):
     try: day_trade_pct = float(row.get('當沖佔比(%)', 0))
     except: day_trade_pct = 0
 
-    # 取得累積次數
     try: cnt_10 = int(float(row.get('近10日注意次數', 0)))
     except: cnt_10 = 0
     try: cnt_30 = int(float(row.get('近30日注意次數', 0)))
@@ -198,7 +206,6 @@ def render_risk_item(row):
     try: streak = int(float(row.get('連續天數', 0)))
     except: streak = 0
 
-    # 1. 處理風險圖示
     if risk_level == '高':
         icon = "🔴"
         label_html = f'<span class="risk-badge risk-high">極高風險</span>'
@@ -209,19 +216,16 @@ def render_risk_item(row):
         icon = "🟢"
         label_html = f'<span class="risk-badge risk-low">低風險</span>'
 
-    # 2. 處理「最快幾天進處置」
     if est_days < 90:
         days_str = f"最快 {est_days} 營業日進處置"
     else:
         days_str = "觀察中"
 
-    # [判斷] 是否為「次數累積」型風險 (10日6次, 30日12次...)
     is_accumulated = (
         "10日" in reason_msg or "30日" in reason_msg or "次" in reason_msg or
         (est_days <= 1 and (cnt_10 >= 5 or cnt_30 >= 11 or streak >= 2))
     )
 
-    # 3. 關鍵觸發條件標題化
     key_conditions = []
     
     if est_days == 1:
@@ -253,7 +257,6 @@ def render_risk_item(row):
     elif est_days == 3:
         key_conditions.append(f"⚠️關鍵: 累積頻繁 留意連續觸發")
 
-    # 4. 組合標題字串
     title_parts = [f"{icon} {stock_id} {stock_name} (現價 {curr_price})", days_str]
     
     if key_conditions:
@@ -272,11 +275,8 @@ def render_risk_item(row):
             
         with c2:
             strategy_text = ""
-            
-            # A. 價格與量能的具體操作建議
             if est_days == 1:
                 strategy_text += f"<b>🔥 明日關鍵一戰</b> (最快1日=今日)<br><br>"
-                
                 if is_accumulated:
                     strategy_text += f"🚨 <b>次數累計滿水位</b>：近10日已 {cnt_10} 次 (門檻6次)。<br>"
                     strategy_text += f"- ⚠️ <b>操作建議</b>：因次數已滿，今日只要觸發<b>任一款</b>注意條款 (最常見為第6款: 收盤漲、週轉率高)，明日即進處置。<br>"
@@ -298,7 +298,6 @@ def render_risk_item(row):
             elif est_days <= 3:
                 strategy_text += f"<b>⚠️ 高度警戒區</b><br>"
                 strategy_text += f"- 未來 <b>{est_days}</b> 天內，若持續上漲或量能失控，極高機率進入處置。<br>"
-            
             else:
                 strategy_text += "✅ <b>目前相對安全</b>，但仍需留意漲跌幅過大被列入注意股。"
 
@@ -312,11 +311,9 @@ def render_risk_item(row):
         with c4:
             st.metric("成交值", f"{turnover_val} 億")
             st.metric("週轉率", f"{turnover_rate} %")
-            
             day_trade_color = "normal"
             if day_trade_pct > 60: day_trade_color = "off"
             st.metric("當沖佔比", f"{day_trade_pct} %", delta="過熱" if day_trade_pct > 60 else None, delta_color=day_trade_color)
-            
             st.write(f"**PE**: {pe} | **PB**: {pb}")
         
         st.markdown("---")
@@ -369,15 +366,11 @@ def clean_tpex_measure(content):
 
 @st.cache_data(ttl=3600)
 def fetch_all_disposition_stocks():
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
     all_stock_list = []
 
-    # 1. 上市
     try:
         url_twse = "https://openapi.twse.com.tw/v1/announcement/punish"
-        # [Fix] 增加 verify=False 忽略 SSL
         res = requests.get(url_twse, headers=headers, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
@@ -386,31 +379,19 @@ def fetch_all_disposition_stocks():
                 name = item.get('Name', '').strip()
                 period = item.get('DispositionPeriod', '').strip()
                 raw_measure = item.get('DispositionMeasures', '').strip()
-                
                 measure = "5分鐘盤"
                 if "第二次" in raw_measure or "再次" in raw_measure: measure = "20分鐘盤"
                 elif "第一次" in raw_measure: measure = "5分鐘盤"
-                
                 if is_active(period):
-                    all_stock_list.append({
-                        '市場': '上市',
-                        '代號': code,
-                        '名稱': name,
-                        '處置期間': period,
-                        '處置措施': measure
-                    })
+                    all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
     except: pass
 
-    # 2. 上櫃
     try:
         url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
-        # [Fix] 增加 verify=False 忽略 SSL
         res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
         data = res.json()
-        
         tpex_data = []
         is_tables = False
-        
         if 'tables' in data and len(data['tables']) > 0:
             tpex_data = data['tables'][0]['data']
             is_tables = True
@@ -422,26 +403,14 @@ def fetch_all_disposition_stocks():
             for row in tpex_data:
                 try:
                     if is_tables:
-                        code = str(row[2]).strip()
-                        raw_name = str(row[3]).strip()
-                        period = str(row[5]).strip()
-                        raw_content = str(row[7]).strip()
+                        code = str(row[2]).strip(); raw_name = str(row[3]).strip(); period = str(row[5]).strip(); raw_content = str(row[7]).strip()
                     else:
-                        code = str(row[1]).strip()
-                        raw_name = str(row[2]).strip()
-                        period = str(row[4]).strip()
-                        raw_content = str(row[6]).strip() if len(row) > 6 else ""
+                        code = str(row[1]).strip(); raw_name = str(row[2]).strip(); period = str(row[4]).strip(); raw_content = str(row[6]).strip() if len(row) > 6 else ""
 
                     if is_active(period):
                         name = clean_tpex_name(raw_name)
                         measure = clean_tpex_measure(raw_content)
-                        all_stock_list.append({
-                            '市場': '上櫃',
-                            '代號': code,
-                            '名稱': name,
-                            '處置期間': period,
-                            '處置措施': measure
-                        })
+                        all_stock_list.append({'市場': '上櫃', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
                 except: continue
     except: pass
 
@@ -457,53 +426,38 @@ def fetch_all_disposition_stocks():
 # ==========================================
 def run_warning_page():
     st.title("⚠️ 處置股預警機")
-    
     col_btn, col_info = st.columns([0.2, 0.8])
     if col_btn.button("🔄 重新讀取資料"):
         st.cache_data.clear() 
         st.rerun()
         
-    # 1. 讀取預警名單
     df = fetch_data_from_sheet()
-    
-    # 2. 讀取處置中名單 (用於過濾)
     df_jail = fetch_all_disposition_stocks()
     jail_codes = []
-    if not df_jail.empty:
-        jail_codes = df_jail['代號'].astype(str).tolist()
+    if not df_jail.empty: jail_codes = df_jail['代號'].astype(str).tolist()
 
     if not df.empty:
         last_date = df.iloc[0]['最近一次日期'] if '最近一次日期' in df.columns else "未知"
         col_info.info(f"資料來源：Google Sheet | 資料日期：{last_date}")
-        
-        # 3. 過濾掉正在坐牢的股票
         initial_count = len(df)
         df = df[~df['代號'].isin(jail_codes)]
         filtered_count = initial_count - len(df)
-        if filtered_count > 0:
-            st.caption(f"已自動隱藏 {filtered_count} 檔正在處置中的股票。")
+        if filtered_count > 0: st.caption(f"已自動隱藏 {filtered_count} 檔正在處置中的股票。")
 
-        # 排序邏輯
         def sort_key(row):
             try: days = int(row.get('最快處置天數', 99))
             except: days = 99
-            
             risk_map = {'高': 3, '中': 2, '低': 1}
             risk_score = risk_map.get(row.get('風險等級', '低'), 0)
-            
             try: streak = int(row.get('連續天數', 0))
             except: streak = 0
-            
-            # Risk(高權重) + Days(越小越前) + Streak(輔助)
             return (risk_score * 10000) + ((100 - days) * 100) + streak
 
         data_list = df.to_dict('records')
         data_list.sort(key=sort_key, reverse=True)
         
         st.subheader(f"📋 潛在風險名單 (共 {len(data_list)} 檔)")
-        for row in data_list:
-            render_risk_item(row)
-            
+        for row in data_list: render_risk_item(row)
     else:
         st.warning("無法讀取資料，請檢查 Google Sheet 連線或確認後端程式是否已執行。")
 
@@ -527,10 +481,8 @@ def run_jail_page():
                 try:
                     styled_df = df_dispo.style.applymap(highlight_status, subset=['處置措施'])
                     st.dataframe(styled_df, hide_index=True, use_container_width=True)
-                except:
-                    st.dataframe(df_dispo, hide_index=True, use_container_width=True)
-            else:
-                st.success("目前沒有處置股。")
+                except: st.dataframe(df_dispo, hide_index=True, use_container_width=True)
+            else: st.success("目前沒有處置股。")
 
 # ==========================================
 # 主程式入口
