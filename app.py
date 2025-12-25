@@ -5,7 +5,7 @@ from fugle_marketdata import RestClient
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Fugle 連線測試", layout="wide")
-st.title("⚡ Fugle API 連線測試診斷")
+st.title("⚡ Fugle API 連線測試診斷 (修正版)")
 
 st.markdown("""
 ### 測試說明
@@ -28,7 +28,6 @@ if st.button("🚀 開始測試連線"):
             stock = client.stock
             
             # 設定測試參數 (抓取台積電 2330 過去 5 天的日 K)
-            # Fugle 不需要 ".TW"，直接給 "2330" 即可
             target_id = "2330"
             today = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -36,11 +35,12 @@ if st.button("🚀 開始測試連線"):
             st.write(f"測試目標: {target_id} | 時間範圍: {start_date} ~ {today}")
             
             # 發送請求
+            # [修正] 移除 'date'，只保留 API 允許的欄位
             data = stock.historical.candles(
                 symbol=target_id,
                 from_=start_date,
                 to=today,
-                fields=["open", "high", "low", "close", "volume", "date"]
+                fields=["open", "high", "low", "close", "volume"]
             )
             
             # 檢查結果
@@ -49,12 +49,13 @@ if st.button("🚀 開始測試連線"):
                 
                 # 轉成 DataFrame 展示
                 df = pd.DataFrame(data['data'])
+                # Fugle 的日期在 data 裡面預設就有，直接轉
                 df['date'] = pd.to_datetime(df['date'])
                 st.dataframe(df)
                 
                 st.markdown("### ✅ 診斷結果：")
                 st.markdown("- Fugle API 在此環境 **可正常運作**。")
-                st.markdown("- 您可以放心地將主程式改為 Fugle 版本。")
+                st.markdown("- 請記得在 Zeabur 設定 `FUGLE_API_KEY` 環境變數。")
             else:
                 st.warning("⚠️ 連線成功，但回傳無資料 (可能是休市或日期範圍問題)。")
                 st.json(data)
