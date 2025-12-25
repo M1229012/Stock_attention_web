@@ -1,65 +1,425 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-from fugle_marketdata import RestClient
-from datetime import datetime, timedelta
+import json
+import os
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import yfinance as yf
+import twstock
+import gspread
+import requests
+import re
+import urllib3
+from datetime import datetime
+from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Fugle 連線測試", layout="wide")
-st.title("⚡ Fugle API 連線測試診斷 (修正版)")
+# 忽略 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# =================設定區=================
+DATA_CACHE_DIR = "stock_cache_warning_v2"
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/1VNgYMxxHoJQPqtntcnPxENOQ2Mbn-wv1kkPoG91l1G8/edit?usp=drive_link"
+GSHEET_NAME = "台股注意股資料庫_V33"
+GSHEET_WORKSHEET = "近30日熱門統計"
+# ========================================
+
+st.set_page_config(page_title="處置股監控中心 Pro", layout="wide", page_icon="🚨")
+
+if not os.path.exists(DATA_CACHE_DIR): os.makedirs(DATA_CACHE_DIR)
+
+# ==========================================
+# 1. 樣式設定
+# ==========================================
 st.markdown("""
-### 測試說明
-此工具用於測試 Zeabur 主機是否能透過 Fugle API 抓取股價資料。
-請先去 [Fugle Developer](https://developer.fugle.tw/) 申請 API Key。
-""")
+<style>
+    [data-testid="stMetricValue"] { font-family: 'Courier New', monospace; color: #ff4b4b; }
+    .stExpander { border: 1px solid #444; border-radius: 5px; }
+    .stButton button { width: 100%; text-align: left; justify-content: flex-start; border: 1px solid #444; }
+    .risk-badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.9em; display: inline-block; }
+    .risk-high { background-color: #521818; color: #ffaaaa; border: 1px solid #ff4b4b; }
+    .risk-mid { background-color: #524400; color: #ffeb3b; border: 1px solid #ffeb3b; }
+    .risk-low { background-color: #183d20; color: #aaffaa; border: 1px solid #4caf50; }
+    .strategy-box { background-color: #262730; padding: 10px; border-radius: 5px; border-left: 5px solid #ff4b4b; margin-top: 10px; line-height: 1.6; }
+    [data-testid="stDataFrame"] { font-size: 0.95rem; }
+</style>
+""", unsafe_allow_html=True)
 
-# 1. 輸入 API Key
-api_key_input = st.text_input("請輸入您的 Fugle API Key:", type="password")
-
-if st.button("🚀 開始測試連線"):
-    if not api_key_input:
-        st.error("❌ 請先輸入 API Key")
-    else:
-        st.info("正在嘗試連線 Fugle 伺服器...")
-        
-        try:
-            # 初始化 Client
-            client = RestClient(api_key=api_key_input)
-            stock = client.stock
-            
-            # 設定測試參數 (抓取台積電 2330 過去 5 天的日 K)
-            target_id = "2330"
-            today = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-            
-            st.write(f"測試目標: {target_id} | 時間範圍: {start_date} ~ {today}")
-            
-            # 發送請求
-            # [修正] 移除 'date'，只保留 API 允許的欄位
-            data = stock.historical.candles(
-                symbol=target_id,
-                from_=start_date,
-                to=today,
-                fields=["open", "high", "low", "close", "volume"]
+# ==========================================
+# 2. 資料讀取 (雲端適配版)
+# ==========================================
+@st.cache_data(ttl=30) 
+def fetch_data_from_sheet():
+    try:
+        gc = None
+        # [修改] 優先檢查 Streamlit Cloud 的 Secrets
+        if "gcp_service_account" in st.secrets:
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = Credentials.from_service_account_info(
+                creds_dict,
+                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
             )
+            gc = gspread.authorize(creds)
+        else:
+            # [保留] 本地端檔案讀取模式
+            json_key_path = "service_key.json"
+            if not os.path.exists(json_key_path):
+                # 嘗試在上一層目錄找
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                json_key_path = os.path.join(current_dir, "service_key.json")
             
-            # 檢查結果
-            if 'data' in data and len(data['data']) > 0:
-                st.success(f"✅ 連線成功！成功取得 {len(data['data'])} 筆 K 線資料。")
-                
-                # 轉成 DataFrame 展示
-                df = pd.DataFrame(data['data'])
-                # Fugle 的日期在 data 裡面預設就有，直接轉
-                df['date'] = pd.to_datetime(df['date'])
-                st.dataframe(df)
-                
-                st.markdown("### ✅ 診斷結果：")
-                st.markdown("- Fugle API 在此環境 **可正常運作**。")
-                st.markdown("- 請記得在 Zeabur 設定 `FUGLE_API_KEY` 環境變數。")
+            if os.path.exists(json_key_path):
+                gc = gspread.service_account(filename=json_key_path)
+
+        if not gc:
+            st.error("⚠️ 找不到憑證 (請在 Streamlit Cloud 設定 Secrets 或檢查 service_key.json)")
+            return pd.DataFrame()
+
+        sh = gc.open_by_url(GSHEET_URL)
+        ws = sh.worksheet(GSHEET_WORKSHEET) 
+        data = ws.get_all_values()
+        
+        if len(data) < 2: return pd.DataFrame()
+        
+        df = pd.DataFrame(data[1:], columns=data[0])
+        df = df[df['代號'].astype(str).str.strip() != '']
+        return df
+
+    except Exception as e:
+        st.error(f"❌ 連接 Google Sheet 錯誤: {e}")
+        return pd.DataFrame()
+
+# ==========================================
+# 3. 畫圖功能 (Yahoo 原版)
+# ==========================================
+def get_yahoo_ticker_code(stock_id):
+    clean_id = str(stock_id).strip()
+    suffix = ".TW" 
+    if clean_id in twstock.codes:
+        if twstock.codes[clean_id].market == '上櫃': suffix = '.TWO'
+    return f"{clean_id}{suffix}"
+
+def fetch_chart_data(stock_id):
+    ticker_code = get_yahoo_ticker_code(stock_id)
+    try:
+        # [微調] 關閉進度條以避免在雲端噴錯
+        ticker = yf.Ticker(ticker_code)
+        df = ticker.history(period="3mo")
+        
+        # 如果主要代號沒資料，嘗試切換市場
+        if df.empty and ".TW" in ticker_code: 
+             ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"))
+             df = ticker.history(period="3mo")
+        
+        if not df.empty:
+            df = df.reset_index()
+            # 處理時區問題
+            if df['Date'].dt.tz is not None:
+                df['Date'] = df['Date'].dt.tz_localize(None)
+            df.set_index('Date', inplace=True)
+            for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+            return df
+    except: pass
+    return pd.DataFrame()
+
+def plot_stock_analysis(stock_id, stock_name):
+    df = fetch_chart_data(stock_id)
+    if df.empty: 
+        st.warning("⚠️ 無法載入 K 線圖數據 (Yahoo 可能暫時限流)")
+        return
+
+    df.index = df.index.strftime('%Y-%m-%d')
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                        row_heights=[0.7, 0.3], subplot_titles=(f'{stock_id} {stock_name}', '成交量'))
+    
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
+                                 low=df['Low'], close=df['Close'], name='K線',
+                                 increasing_line_color='#ff4b4b', decreasing_line_color='#00da3c'), row=1, col=1)
+    
+    colors = {'MA5':'#00FFFF', 'MA10':'#FFFF00', 'MA20':'#FF00FF', 'MA60':'#00FF00'}
+    for ma, color in colors.items():
+        if ma in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[ma], line=dict(color=color, width=1), name=ma), row=1, col=1)
+            
+    colors_vol = ['#ff4b4b' if c >= o else '#00da3c' for c, o in zip(df['Close'], df['Open'])]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='成交量'), row=2, col=1)
+    
+    fig.update_layout(height=500, template='plotly_dark', xaxis_rangeslider_visible=False, 
+                      showlegend=False, margin=dict(l=10, r=10, t=30, b=10))
+    
+    fig.update_xaxes(type='category', tickmode='auto', nticks=10) 
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================
+# 4. UI 呈現
+# ==========================================
+def render_risk_item(row):
+    stock_id = row['代號']
+    stock_name = row['名稱']
+    risk_level = row.get('風險等級', '低')
+    trigger_msg = row.get('觸發條件', '')
+    reason_msg = row.get('處置觸發原因', '')
+    
+    try: est_days = int(row.get('最快處置天數', 99))
+    except: est_days = 99
+    
+    # 數值轉換容錯處理
+    def safe_float(v):
+        try: return float(str(v).replace(',', ''))
+        except: return 0
+    def safe_int(v):
+        try: return int(float(str(v).replace(',', '')))
+        except: return 0
+
+    curr_price = safe_float(row.get('目前價'))
+    limit_price = safe_float(row.get('警戒價'))
+    gap_pct = safe_float(row.get('差幅(%)'))
+    curr_vol = safe_int(row.get('目前量'))
+    limit_vol = safe_int(row.get('警戒量'))
+    
+    turnover_val = safe_float(row.get('成交值(億)'))
+    turnover_rate = safe_float(row.get('週轉率(%)'))
+    pe = safe_float(row.get('PE'))
+    pb = safe_float(row.get('PB'))
+    day_trade_pct = safe_float(row.get('當沖佔比(%)'))
+
+    cnt_10 = safe_int(row.get('近10日注意次數'))
+    cnt_30 = safe_int(row.get('近30日注意次數'))
+    streak = safe_int(row.get('連續天數'))
+
+    # 風險圖示
+    if risk_level == '高':
+        icon = "🔴"
+        label_html = f'<span class="risk-badge risk-high">極高風險</span>'
+    elif risk_level == '中':
+        icon = "🟡"
+        label_html = f'<span class="risk-badge risk-mid">中風險</span>'
+    else:
+        icon = "🟢"
+        label_html = f'<span class="risk-badge risk-low">低風險</span>'
+
+    days_str = f"最快 {est_days} 營業日進處置" if est_days < 90 else "觀察中"
+
+    is_accumulated = (
+        "10日" in reason_msg or "30日" in reason_msg or "次" in reason_msg or
+        (est_days <= 1 and (cnt_10 >= 5 or cnt_30 >= 11 or streak >= 2))
+    )
+
+    key_conditions = []
+    
+    if est_days == 1:
+        if is_accumulated:
+            key_conditions.append(f"🔥關鍵: 明日只要 漲/量增 即進處置")
+        else:
+            conds = []
+            if limit_price > 0: 
+                if curr_price >= limit_price: conds.append(f"⚠️現價{curr_price}>警戒{limit_price}")
+                else: conds.append(f"💰安{curr_price}<警{limit_price}")
+            
+            if limit_vol > 0:
+                if curr_vol >= limit_vol: conds.append(f"⚠️現量{curr_vol:,}>警戒{limit_vol:,}")
+                else: conds.append(f"量<警戒{limit_vol:,}")
+            
+            if conds: key_conditions.append(f"🔥 {' | '.join(conds)}")
+            else: key_conditions.append(f"🔥關鍵: 明日 再觸發任一條款 即進處置")
+
+    elif est_days == 2:
+        key_conditions.append(f"🔥關鍵: 未來三日 任兩日漲/達標 即進處置")
+
+    elif est_days == 3:
+        key_conditions.append(f"⚠️關鍵: 累積頻繁 留意連續觸發")
+
+    title_parts = [f"{icon} {stock_id} {stock_name} (現價 {curr_price})", days_str]
+    if key_conditions: title_parts.extend(key_conditions)
+    title_text = " | ".join(title_parts)
+    
+    with st.expander(title_text):
+        c1, c2, c3, c4 = st.columns([0.25, 0.25, 0.25, 0.25])
+        
+        with c1:
+            st.markdown(f"#### 風險：{label_html}", unsafe_allow_html=True)
+            st.markdown(f"#### 預測：{days_str}", unsafe_allow_html=True)
+            if reason_msg:
+                st.markdown(f"<div style='color:#ffaaaa; font-size:0.9em;'>⚠️ {reason_msg}</div>", unsafe_allow_html=True)
+            
+        with c2:
+            strategy_text = ""
+            if est_days == 1:
+                strategy_text += f"<b>🔥 明日關鍵一戰</b> (最快1日=今日)<br><br>"
+                if is_accumulated:
+                    strategy_text += f"🚨 <b>次數累計滿水位</b>：近10日已 {cnt_10} 次 (門檻6次)。<br>"
+                    strategy_text += f"- ⚠️ <b>操作建議</b>：因次數已滿，今日只要觸發<b>任一款</b>注意條款 (最常見為第6款: 收盤漲、週轉率高)，明日即進處置。<br>"
+                    strategy_text += f"- ⛔ <b>請勿追高</b>：這類股票只要收紅盤或量能維持，極高機率被關。<br>"
+                else:
+                    strategy_text += f"📊 <b>價量防守線</b>：<br>"
+                    if limit_price > 0:
+                        strategy_text += f"- {'⚠️ 價格危險' if curr_price >= limit_price else '✅ 價格安全'}：現價 {curr_price} vs 警戒 {limit_price}<br>"
+                    if limit_vol > 0:
+                        strategy_text += f"- {'⚠️ 量能危險' if curr_vol >= limit_vol else '✅ 量能安全'}：現量 {curr_vol:,} vs 警戒 {limit_vol:,}<br>"
+            elif est_days <= 3:
+                strategy_text += f"<b>⚠️ 高度警戒區</b><br>- 未來 {est_days} 天內，若持續上漲或量能失控，極高機率進入處置。<br>"
             else:
-                st.warning("⚠️ 連線成功，但回傳無資料 (可能是休市或日期範圍問題)。")
-                st.json(data)
-                
-        except Exception as e:
-            st.error(f"❌ 連線失敗 (Crash): {e}")
-            st.write("常見原因：API Key 錯誤、額度用盡、或套件版本不相容。")
+                strategy_text += "✅ <b>目前相對安全</b>，但仍需留意漲跌幅過大被列入注意股。"
+
+            st.markdown(f"<div class='strategy-box'>{strategy_text}</div>", unsafe_allow_html=True)
+
+        with c3:
+            st.metric("近30日累積", f"{cnt_30} 次", help="門檻: 12次")
+            st.metric("近10日累積", f"{cnt_10} 次", help="門檻: 6次")
+            st.metric("連續天數", f"{streak} 天", help="門檻: 3天或5天")
+            
+        with c4:
+            st.metric("成交值", f"{turnover_val} 億")
+            st.metric("週轉率", f"{turnover_rate} %")
+            day_trade_color = "off" if day_trade_pct > 60 else "normal"
+            st.metric("當沖佔比", f"{day_trade_pct} %", delta="過熱" if day_trade_pct > 60 else None, delta_color=day_trade_color)
+            st.write(f"**PE**: {pe} | **PB**: {pb}")
+        
+        st.markdown("---")
+        plot_stock_analysis(stock_id, stock_name)
+
+# ==========================================
+# 5. 輔助函數 (處置中股票用)
+# ==========================================
+def get_today_date():
+    return datetime.now().date()
+
+def parse_roc_date(roc_date_str):
+    try:
+        roc_date_str = str(roc_date_str).strip()
+        parts = re.split(r'[/-]', roc_date_str)
+        if len(parts) == 3:
+            return datetime(int(parts[0])+1911, int(parts[1]), int(parts[2])).date()
+    except: return None
+    return None
+
+def is_active(period_str):
+    if not period_str: return False
+    dates = []
+    if '～' in period_str: dates = period_str.split('～')
+    elif '~' in period_str: dates = period_str.split('~')
+    elif '-' in period_str: dates = period_str.split('-')
+    if len(dates) >= 2:
+        end = parse_roc_date(dates[1])
+        if end and end >= get_today_date(): return True
+    return False
+
+def clean_tpex_name(raw_name):
+    return raw_name.split('(')[0] if '(' in raw_name else raw_name
+
+def clean_tpex_measure(content):
+    if any(k in content for k in ["第二次", "再次", "每20分鐘", "每25分鐘", "每60分鐘"]): return "20分鐘盤"
+    return "5分鐘盤"
+
+@st.cache_data(ttl=3600)
+def fetch_all_disposition_stocks():
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    all_stock_list = []
+
+    # [微調] 增加 verify=False 以防雲端 SSL 錯誤
+    try:
+        url_twse = "https://openapi.twse.com.tw/v1/announcement/punish"
+        res = requests.get(url_twse, headers=headers, timeout=10, verify=False)
+        if res.status_code == 200:
+            for item in res.json():
+                code, name = item.get('Code', '').strip(), item.get('Name', '').strip()
+                period = item.get('DispositionPeriod', '').strip()
+                raw_measure = item.get('DispositionMeasures', '').strip()
+                measure = "20分鐘盤" if any(k in raw_measure for k in ["第二次","再次"]) else "5分鐘盤"
+                if is_active(period):
+                    all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
+    except: pass
+
+    try:
+        url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
+        res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
+        data = res.json()
+        
+        tpex_data = data.get('tables', [{}])[0].get('data', []) or data.get('aaData', [])
+        
+        for row in tpex_data:
+            try:
+                # 簡單判斷格式
+                if len(row) >= 8:
+                    code, raw_name, period, raw_content = str(row[2]).strip(), str(row[3]).strip(), str(row[5]).strip(), str(row[7]).strip()
+                else:
+                    code, raw_name, period, raw_content = str(row[1]).strip(), str(row[2]).strip(), str(row[4]).strip(), str(row[6]).strip() if len(row)>6 else ""
+
+                if is_active(period):
+                    all_stock_list.append({
+                        '市場': '上櫃', '代號': code, 
+                        '名稱': clean_tpex_name(raw_name), 
+                        '處置期間': period, 
+                        '處置措施': clean_tpex_measure(raw_content)
+                    })
+            except: continue
+    except: pass
+
+    df = pd.DataFrame(all_stock_list)
+    if not df.empty:
+        df['sort_key'] = df['市場'].map({'上市': 0, '上櫃': 1})
+        df = df.sort_values(by=['sort_key', '代號'], ascending=[True, True])
+        df = df[['市場', '代號', '名稱', '處置期間', '處置措施']]
+    return df
+
+# ==========================================
+# 6. 主頁面
+# ==========================================
+def run_warning_page():
+    st.title("⚠️ 處置股預警機")
+    
+    col_btn, col_info = st.columns([0.2, 0.8])
+    if col_btn.button("🔄 重新讀取資料"):
+        st.cache_data.clear() 
+        st.rerun()
+        
+    df = fetch_data_from_sheet()
+    df_jail = fetch_all_disposition_stocks()
+    jail_codes = df_jail['代號'].astype(str).tolist() if not df_jail.empty else []
+
+    if not df.empty:
+        last_date = df.iloc[0].get('最近一次日期', '未知')
+        col_info.info(f"資料來源：Google Sheet | 資料日期：{last_date}")
+        
+        initial_count = len(df)
+        df = df[~df['代號'].isin(jail_codes)]
+        filtered_count = initial_count - len(df)
+        if filtered_count > 0: st.caption(f"已自動隱藏 {filtered_count} 檔正在處置中的股票。")
+
+        def sort_key(row):
+            try: days = int(row.get('最快處置天數', 99))
+            except: days = 99
+            risk_map = {'高': 3, '中': 2, '低': 1}
+            return (risk_map.get(row.get('風險等級', '低'), 0) * 10000) + ((100 - days) * 100)
+
+        data_list = df.to_dict('records')
+        data_list.sort(key=sort_key, reverse=True)
+        
+        st.subheader(f"📋 潛在風險名單 (共 {len(data_list)} 檔)")
+        for row in data_list: render_risk_item(row)
+    else:
+        st.warning("無法讀取資料，請檢查 Google Sheet 連線或確認後端程式是否已執行。")
+
+def run_jail_page():
+    st.title("🔒 處置中股票")
+    if st.button("🔄 抓取最新名單"):
+        with st.spinner("連線中..."):
+            df_dispo = fetch_all_disposition_stocks()
+            if not df_dispo.empty:
+                st.success(f"目前共有 {len(df_dispo)} 檔處置股。")
+                def highlight_status(val):
+                    color = '#521818' if '20分鐘' in str(val) else '#3d3300' if '5分鐘' in str(val) else ''
+                    return f'background-color: {color}; font-weight: bold; border-radius: 5px;' if color else ''
+                try:
+                    st.dataframe(df_dispo.style.applymap(highlight_status, subset=['處置措施']), hide_index=True, use_container_width=True)
+                except:
+                    st.dataframe(df_dispo, hide_index=True, use_container_width=True)
+            else: st.success("目前沒有處置股。")
+
+with st.sidebar:
+    st.title("⚡ 監控中心")
+    page = st.radio("功能", ["⚠️ 處置預警", "🔒 處置中股票"])
+
+if page == "⚠️ 處置預警": run_warning_page()
+elif page == "🔒 處置中股票": run_jail_page()
