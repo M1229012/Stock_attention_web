@@ -1,32 +1,23 @@
-import time, random
+from fugle_marketdata import RestClient
 import pandas as pd
-import yfinance as yf
-import streamlit as st
 
-# 1) 全域節流：跨 rerun 生效
-def throttle(min_interval=2.0):
-    if "last_yahoo_ts" not in st.session_state:
-        st.session_state.last_yahoo_ts = 0.0
-    now = time.monotonic()
-    wait = st.session_state.last_yahoo_ts + min_interval - now
-    if wait > 0:
-        time.sleep(wait)
-    st.session_state.last_yahoo_ts = time.monotonic()
+# 初始化 (填入您的 API Key)
+client = RestClient(api_key="NzY3NTRkMjktMDAwYS00OWYzLWE1ZGQtNTRkM2M2ODA1NTA5IGVlNDAxODIyLWE2YmQtNDlhOC1hZTQwLTZmMjRkMTBmNGM3Mw==")
 
-# 2) 快取：同一檔短時間不要重抓
-@st.cache_data(ttl=3600, show_spinner=False)  # 1 小時
-def fetch_yahoo(symbol: str) -> pd.DataFrame:
-    t = yf.Ticker(symbol)
-
-    for i in range(6):  # 退避重試
-        throttle(2.0)
-        df = t.history(period="3mo", interval="1d", auto_adjust=False)
-
-        if not df.empty:
-            if getattr(df.index, "tz", None):
-                df.index = df.index.tz_localize(None)
-            return df
-
-        time.sleep(min(60, (2 ** i) + random.random()))
-
-    return pd.DataFrame()
+def fetch_kline_fugle(stock_id):
+    stock = client.stock  # Stock API
+    
+    # 抓取歷史 K 線 (日線)
+    data = stock.historical.candles(
+        symbol=stock_id, 
+        from_="2023-09-01", 
+        to_="2023-12-25", 
+        fields=["open", "high", "low", "close", "volume"]
+    )
+    
+    # 轉成 DataFrame
+    df = pd.DataFrame(data['data'])
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date')
+    
+    return df
