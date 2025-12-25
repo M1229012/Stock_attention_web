@@ -10,3 +10,4 @@ urllib3
 requests
 lxml
 curl_cffi
+fugle-marketdata
