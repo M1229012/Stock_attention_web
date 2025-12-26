@@ -11,8 +11,10 @@ import gspread
 import requests
 import re
 import urllib3
-from datetime import datetime
+# ✅ 修正 1: 補上 date import，避免 is_active() 噴錯
+from datetime import datetime, date
 from google.oauth2.service_account import Credentials
+from zoneinfo import ZoneInfo
 
 # 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -52,7 +54,7 @@ st.markdown("""
 def fetch_data_from_sheet():
     try:
         gc = None
-        # [修改] 優先檢查 Streamlit Cloud 的 Secrets
+        # 優先檢查 Streamlit Cloud 的 Secrets
         if "gcp_service_account" in st.secrets:
             creds_dict = st.secrets["gcp_service_account"]
             creds = Credentials.from_service_account_info(
@@ -61,10 +63,9 @@ def fetch_data_from_sheet():
             )
             gc = gspread.authorize(creds)
         else:
-            # [保留] 本地端檔案讀取模式
+            # 本地端檔案讀取模式
             json_key_path = "service_key.json"
             if not os.path.exists(json_key_path):
-                # 嘗試在上一層目錄找
                 current_dir = os.path.dirname(os.path.abspath(__file__))
                 json_key_path = os.path.join(current_dir, "service_key.json")
             
@@ -102,18 +103,15 @@ def get_yahoo_ticker_code(stock_id):
 def fetch_chart_data(stock_id):
     ticker_code = get_yahoo_ticker_code(stock_id)
     try:
-        # [微調] 關閉進度條以避免在雲端噴錯
         ticker = yf.Ticker(ticker_code)
         df = ticker.history(period="3mo")
         
-        # 如果主要代號沒資料，嘗試切換市場
         if df.empty and ".TW" in ticker_code: 
              ticker = yf.Ticker(ticker_code.replace(".TW", ".TWO"))
              df = ticker.history(period="3mo")
         
         if not df.empty:
             df = df.reset_index()
-            # 處理時區問題
             if df['Date'].dt.tz is not None:
                 df['Date'] = df['Date'].dt.tz_localize(None)
             df.set_index('Date', inplace=True)
@@ -164,7 +162,6 @@ def render_risk_item(row):
     try: est_days = int(row.get('最快處置天數', 99))
     except: est_days = 99
     
-    # 數值轉換容錯處理
     def safe_float(v):
         try: return float(str(v).replace(',', ''))
         except: return 0
@@ -174,7 +171,6 @@ def render_risk_item(row):
 
     curr_price = safe_float(row.get('目前價'))
     limit_price = safe_float(row.get('警戒價'))
-    gap_pct = safe_float(row.get('差幅(%)'))
     curr_vol = safe_int(row.get('目前量'))
     limit_vol = safe_int(row.get('警戒量'))
     
@@ -188,7 +184,6 @@ def render_risk_item(row):
     cnt_30 = safe_int(row.get('近30日注意次數'))
     streak = safe_int(row.get('連續天數'))
 
-    # 風險圖示
     if risk_level == '高':
         icon = "🔴"
         label_html = f'<span class="risk-badge risk-high">極高風險</span>'
@@ -280,17 +275,18 @@ def render_risk_item(row):
         plot_stock_analysis(stock_id, stock_name)
 
 # ==========================================
-# 5. 輔助函數 (處置中股票用)
+# 5. 輔助函數 (處置中股票用) - 本地一致版
 # ==========================================
 def get_today_date():
-    return datetime.now().date()
+    # 強制使用台灣時間，確保換日邏輯一致
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
 
 def parse_roc_date(roc_date_str):
     try:
         roc_date_str = str(roc_date_str).strip()
         parts = re.split(r'[/-]', roc_date_str)
         if len(parts) == 3:
-            return datetime(int(parts[0])+1911, int(parts[1]), int(parts[2])).date()
+            return date(int(parts[0])+1911, int(parts[1]), int(parts[2]))
     except: return None
     return None
 
@@ -300,9 +296,14 @@ def is_active(period_str):
     if '～' in period_str: dates = period_str.split('～')
     elif '~' in period_str: dates = period_str.split('~')
     elif '-' in period_str: dates = period_str.split('-')
+    
     if len(dates) >= 2:
+        start = parse_roc_date(dates[0])
         end = parse_roc_date(dates[1])
-        if end and end >= get_today_date(): return True
+        today = get_today_date()
+        # 嚴格判斷：今天必須在處置期間內 (含起訖日)
+        if start and end and start <= today <= end:
+            return True
     return False
 
 def clean_tpex_name(raw_name):
@@ -317,38 +318,50 @@ def fetch_all_disposition_stocks():
     headers = {'User-Agent': 'Mozilla/5.0'}
     all_stock_list = []
 
-    # [微調] 增加 verify=False 以防雲端 SSL 錯誤
+    # 1. 上市 (TWSE) - 移除 verify=False，使用標準流程
     try:
         url_twse = "https://openapi.twse.com.tw/v1/announcement/punish"
-        res = requests.get(url_twse, headers=headers, timeout=10, verify=False)
+        res = requests.get(url_twse, headers=headers, timeout=10)
         if res.status_code == 200:
             for item in res.json():
-                code, name = item.get('Code', '').strip(), item.get('Name', '').strip()
+                code = item.get('Code', '').strip()
+                # ✅ 修正 2: 增加四碼檢查
+                if not (code.isdigit() and len(code) == 4): continue
+
+                name = item.get('Name', '').strip()
                 period = item.get('DispositionPeriod', '').strip()
                 raw_measure = item.get('DispositionMeasures', '').strip()
+                
                 measure = "20分鐘盤" if any(k in raw_measure for k in ["第二次","再次"]) else "5分鐘盤"
+                
                 if is_active(period):
                     all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
     except: pass
 
+    # 2. 上櫃 (TPEx) - 移除 verify=False，移除 len>=8 模糊猜測，改回標準索引
     try:
         url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
-        res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
+        res = requests.get(url_tpex, headers=headers, timeout=10)
         data = res.json()
         
-        tpex_data = data.get('tables', [{}])[0].get('data', []) or data.get('aaData', [])
+        # 鎖定讀取 aaData，並使用固定索引 (確保跟本地邏輯一樣)
+        tpex_data = data.get('aaData', [])
         
         for row in tpex_data:
             try:
-                # 簡單判斷格式
-                if len(row) >= 8:
-                    code, raw_name, period, raw_content = str(row[2]).strip(), str(row[3]).strip(), str(row[5]).strip(), str(row[7]).strip()
-                else:
-                    code, raw_name, period, raw_content = str(row[1]).strip(), str(row[2]).strip(), str(row[4]).strip(), str(row[6]).strip() if len(row)>6 else ""
+                # 標準格式: [0]日期, [1]代號, [2]名稱, [3]發行?, [4]處置起訖, [5]處置措施
+                code = str(row[1]).strip()
+                # ✅ 修正 2: 增加四碼檢查
+                if not (code.isdigit() and len(code) == 4): continue
+
+                raw_name = str(row[2]).strip()
+                period = str(row[4]).strip()
+                raw_content = str(row[5]).strip()
 
                 if is_active(period):
                     all_stock_list.append({
-                        '市場': '上櫃', '代號': code, 
+                        '市場': '上櫃', 
+                        '代號': code, 
                         '名稱': clean_tpex_name(raw_name), 
                         '處置期間': period, 
                         '處置措施': clean_tpex_measure(raw_content)
@@ -369,23 +382,34 @@ def fetch_all_disposition_stocks():
 def run_warning_page():
     st.title("⚠️ 處置股預警機")
     
-    col_btn, col_info = st.columns([0.2, 0.8])
-    if col_btn.button("🔄 重新讀取資料"):
+    col_btn, col_chk, col_info = st.columns([0.2, 0.2, 0.6])
+    
+    if col_btn.button("🔄 重新讀取"):
         st.cache_data.clear() 
         st.rerun()
+    
+    # 讓使用者決定要不要看已經被關的股票
+    show_jail_stocks = col_chk.checkbox("顯示已處置股", value=False)
         
     df = fetch_data_from_sheet()
     df_jail = fetch_all_disposition_stocks()
-    jail_codes = df_jail['代號'].astype(str).tolist() if not df_jail.empty else []
+    # ✅ 修正 3: 增加 str.strip()，確保比對精確
+    jail_codes = df_jail['代號'].astype(str).str.strip().tolist() if not df_jail.empty else []
 
     if not df.empty:
         last_date = df.iloc[0].get('最近一次日期', '未知')
         col_info.info(f"資料來源：Google Sheet | 資料日期：{last_date}")
         
         initial_count = len(df)
-        df = df[~df['代號'].isin(jail_codes)]
-        filtered_count = initial_count - len(df)
-        if filtered_count > 0: st.caption(f"已自動隱藏 {filtered_count} 檔正在處置中的股票。")
+        
+        # 修改邏輯：只有在「不勾選」顯示處置股時，才進行過濾
+        if not show_jail_stocks:
+            df = df[~df['代號'].isin(jail_codes)]
+            filtered_count = initial_count - len(df)
+            if filtered_count > 0: 
+                st.caption(f"🙈 已自動隱藏 {filtered_count} 檔正在處置中的股票 (勾選上方『顯示已處置股』可查看)。")
+        else:
+            st.caption(f"👀 目前顯示所有清單內的股票 (含處置中)。")
 
         def sort_key(row):
             try: days = int(row.get('最快處置天數', 99))
@@ -397,7 +421,16 @@ def run_warning_page():
         data_list.sort(key=sort_key, reverse=True)
         
         st.subheader(f"📋 潛在風險名單 (共 {len(data_list)} 檔)")
-        for row in data_list: render_risk_item(row)
+        
+        if len(data_list) == 0:
+            st.info("目前沒有符合條件的股票。")
+        
+        for row in data_list: 
+            # 額外標註一下是否在處置中
+            is_in_jail = str(row['代號']) in jail_codes
+            if is_in_jail:
+                row['名稱'] = f"(🔒處置中) {row['名稱']}"
+            render_risk_item(row)
     else:
         st.warning("無法讀取資料，請檢查 Google Sheet 連線或確認後端程式是否已執行。")
 
