@@ -394,6 +394,9 @@ def run_warning_page():
     
     # 讓使用者決定要不要看已經被關的股票
     show_jail_stocks = col_chk.checkbox("顯示已處置股", value=False)
+    
+    # ✅ 新增：搜尋欄
+    search_term = st.text_input("🔍 搜尋股票 (輸入代號或名稱)", "").strip()
         
     df = fetch_data_from_sheet()
     df_jail = fetch_all_disposition_stocks()
@@ -404,22 +407,30 @@ def run_warning_page():
         last_date = df.iloc[0].get('最近一次日期', '未知')
         col_info.info(f"資料來源：Google Sheet | 資料日期：{last_date}")
         
-        initial_count = len(df)
-        
         # 修改邏輯：只有在「不勾選」顯示處置股時，才進行過濾
         if not show_jail_stocks:
             df = df[~df['代號'].isin(jail_codes)]
-            filtered_count = initial_count - len(df)
-            if filtered_count > 0: 
-                st.caption(f"🙈 已自動隱藏 {filtered_count} 檔正在處置中的股票 (勾選上方『顯示已處置股』可查看)。")
-        else:
-            st.caption(f"👀 目前顯示所有清單內的股票 (含處置中)。")
+        
+        # ✅ 新增：搜尋過濾邏輯
+        if search_term:
+            df = df[df['代號'].astype(str).str.contains(search_term) | df['名稱'].astype(str).str.contains(search_term)]
 
+        # ✅ 優化排序：天數越少越前面 (權重最大)，其次是風險等級
         def sort_key(row):
             try: days = int(row.get('最快處置天數', 99))
             except: days = 99
+            
+            # 前端強制修正風險等級 (讓排序正確)
+            risk_level = row.get('風險等級', '低')
+            if days <= 2: risk_level = '高'
+            
             risk_map = {'高': 3, '中': 2, '低': 1}
-            return (risk_map.get(row.get('風險等級', '低'), 0) * 10000) + ((100 - days) * 100)
+            risk_score = risk_map.get(risk_level, 0)
+            
+            # 排序公式：
+            # 1. 天數 (越小分越高): (100 - days) * 100000 -> 權重最大，確保剩1天的排在剩2天的前面
+            # 2. 風險 (越高分越高): risk_score * 1000
+            return ((100 - days) * 100000) + (risk_score * 1000)
 
         data_list = df.to_dict('records')
         data_list.sort(key=sort_key, reverse=True)
