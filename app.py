@@ -162,6 +162,10 @@ def render_risk_item(row):
     try: est_days = int(row.get('最快處置天數', 99))
     except: est_days = 99
     
+    # ✅ [前端修正]：強制把剩 2 天以內的股票升級為「高風險(紅燈)」
+    if est_days <= 2:
+        risk_level = '高'
+    
     def safe_float(v):
         try: return float(str(v).replace(',', ''))
         except: return 0
