@@ -327,14 +327,15 @@ def clean_tpex_measure(content):
 
 def safe_get(url, headers=None, timeout=10):
     """
-    先用 verify=True 嘗試；若遇到 Streamlit Cloud 常見的 SSLCertVerificationError，
-    則 fallback 到 verify=False 以確保能抓到公開資料。
+    Streamlit Cloud 上 openapi.twse / tpex 常見 OpenSSL 驗證問題：
+    直接強制 verify=False，避免每次先 verify=True 一定炸。
     """
     try:
-        return requests.get(url, headers=headers, timeout=timeout)  # 預設 verify=True
-    except SSLError as e:
-        st.warning(f"⚠️ SSL 驗證失敗，改用 verify=False 抓取：{e}")
-        return requests.get(url, headers=headers, timeout=timeout, verify=False)
+        res = requests.get(url, headers=headers, timeout=timeout, verify=False)
+        return res
+    except Exception as e:
+        st.error(f"❌ 請求失敗: {url}\n原因: {e}")
+        raise
 
 def safe_json(res):
     """避免 res.json() 因為 BOM/非 JSON 直接炸掉"""
@@ -355,7 +356,8 @@ def fetch_all_disposition_stocks():
         res = safe_get(url_twse, headers=headers, timeout=10)
         
         if res.status_code == 200:
-            for item in res.json():
+            payload = safe_json(res)
+            for item in payload:
                 code = item.get('Code', '').strip()
                 # ✅ 修正 2: 增加四碼檢查
                 if not (code.isdigit() and len(code) == 4): continue
@@ -368,6 +370,8 @@ def fetch_all_disposition_stocks():
                 
                 if is_active(period):
                     all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
+        else:
+            st.error(f"TWSE 回傳非 200: {res.status_code}\n{res.text[:200]}")
     except Exception as e:
         st.error(f"TWSE 處置股抓取失敗: {e}")
 
@@ -376,6 +380,10 @@ def fetch_all_disposition_stocks():
         # ✅ 官方 OpenAPI：上櫃處置有價證券資訊
         url_tpex_api = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"
         res = safe_get(url_tpex_api, headers=headers, timeout=10)
+        
+        if res.status_code != 200:
+            st.error(f"TPEx OpenAPI 非 200: {res.status_code}\n{res.text[:200]}")
+
         payload = safe_json(res)
 
         # 這個 API 實務上通常回傳「list[dict]」
@@ -410,6 +418,10 @@ def fetch_all_disposition_stocks():
         if len([x for x in all_stock_list if x.get("市場") == "上櫃"]) == 0:
             url_tpex_old = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
             res2 = safe_get(url_tpex_old, headers=headers, timeout=10)
+            
+            if res2.status_code != 200:
+                st.error(f"TPEx 舊端點非 200: {res2.status_code}\n{res2.text[:200]}")
+
             data2 = safe_json(res2)
             tpex_data = data2.get("aaData", [])
 
