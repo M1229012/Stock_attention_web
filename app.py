@@ -295,20 +295,27 @@ def parse_roc_date(roc_date_str):
     return None
 
 def is_active(period_str):
-    if not period_str: return False
-    dates = []
-    if '～' in period_str: dates = period_str.split('～')
-    elif '~' in period_str: dates = period_str.split('~')
-    elif '-' in period_str: dates = period_str.split('-')
-    
-    if len(dates) >= 2:
-        start = parse_roc_date(dates[0])
-        end = parse_roc_date(dates[1])
+    if not period_str:
+        return False
+
+    s = str(period_str).strip()
+
+    # 抓出字串中前兩個「民國日期」(例如 114/12/25 或 114-12-25)
+    m = re.findall(r'(\d{2,3})[/-](\d{1,2})[/-](\d{1,2})', s)
+    if len(m) < 2:
+        return False
+
+    def roc_to_date(t):
+        y, mo, d = map(int, t)
+        return date(y + 1911, mo, d)
+
+    try:
+        start = roc_to_date(m[0])
+        end = roc_to_date(m[1])
         today = get_today_date()
-        # 嚴格判斷：今天必須在處置期間內 (含起訖日)
-        if start and end and start <= today <= end:
-            return True
-    return False
+        return start <= today <= end
+    except:
+        return False
 
 def clean_tpex_name(raw_name):
     return raw_name.split('(')[0] if '(' in raw_name else raw_name
@@ -340,7 +347,8 @@ def fetch_all_disposition_stocks():
                 
                 if is_active(period):
                     all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
-    except: pass
+    except Exception as e:
+        st.error(f"TWSE 處置股抓取失敗: {e}")
 
     # 2. 上櫃 (TPEx) - 移除 verify=False，移除 len>=8 模糊猜測，改回標準索引
     try:
@@ -371,7 +379,8 @@ def fetch_all_disposition_stocks():
                         '處置措施': clean_tpex_measure(raw_content)
                     })
             except: continue
-    except: pass
+    except Exception as e:
+        st.error(f"TPEx 處置股抓取失敗: {e}")
 
     df = pd.DataFrame(all_stock_list)
     if not df.empty:
@@ -452,6 +461,7 @@ def run_warning_page():
 def run_jail_page():
     st.title("🔒 處置中股票")
     if st.button("🔄 抓取最新名單"):
+        st.cache_data.clear()
         with st.spinner("連線中..."):
             df_dispo = fetch_all_disposition_stocks()
             if not df_dispo.empty:
