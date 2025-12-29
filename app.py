@@ -336,6 +336,13 @@ def safe_get(url, headers=None, timeout=10):
         st.warning(f"⚠️ SSL 驗證失敗，改用 verify=False 抓取：{e}")
         return requests.get(url, headers=headers, timeout=timeout, verify=False)
 
+def safe_json(res):
+    """避免 res.json() 因為 BOM/非 JSON 直接炸掉"""
+    try:
+        return res.json()
+    except Exception:
+        return json.loads(res.text.lstrip("\ufeff").strip())
+
 @st.cache_data(ttl=300)
 def fetch_all_disposition_stocks():
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -364,22 +371,56 @@ def fetch_all_disposition_stocks():
     except Exception as e:
         st.error(f"TWSE 處置股抓取失敗: {e}")
 
-    # 2. 上櫃 (TPEx) - 移除 verify=False，移除 len>=8 模糊猜測，改回標準索引
+    # 2. 上櫃 (TPEx) - 改用 TPEx OpenAPI v1（本地/雲端都更穩），舊 aaData 當 fallback
     try:
-        url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
-        # 使用 safe_get
-        res = safe_get(url_tpex, headers=headers, timeout=10)
-        data = res.json()
-        
-        # 鎖定讀取 aaData，並使用固定索引 (確保跟本地邏輯一樣)
-        tpex_data = data.get('aaData', [])
-        
-        for row in tpex_data:
-            try:
-                # 標準格式: [0]日期, [1]代號, [2]名稱, [3]發行?, [4]處置起訖, [5]處置措施
+        # ✅ 官方 OpenAPI：上櫃處置有價證券資訊
+        url_tpex_api = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"
+        res = safe_get(url_tpex_api, headers=headers, timeout=10)
+        payload = safe_json(res)
+
+        # 這個 API 實務上通常回傳「list[dict]」
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        if not isinstance(payload, list):
+            payload = []
+
+        for item in payload:
+            code = str(item.get("SecuritiesCompanyCode", "")).strip()
+            if not (code.isdigit() and len(code) == 4):
+                continue
+
+            name = str(item.get("CompanyName", "")).strip()
+            period = str(item.get("DispositionPeriod", "")).strip()
+
+            # 有些欄位名稱會因版本不同而有內容差異，這裡做保險
+            reason = str(item.get("DispositionReasons", "")).strip()
+            cond = str(item.get("DisposalCondition", "")).strip()
+            raw_content = (cond or reason)
+
+            if is_active(period):
+                all_stock_list.append({
+                    "市場": "上櫃",
+                    "代號": code,
+                    "名稱": clean_tpex_name(name),
+                    "處置期間": period,
+                    "處置措施": clean_tpex_measure(raw_content),
+                })
+
+        # ✅ 若 OpenAPI 端點回來是空（被擋/格式變），再用你本來 aaData 的舊端點備援
+        if len([x for x in all_stock_list if x.get("市場") == "上櫃"]) == 0:
+            url_tpex_old = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
+            res2 = safe_get(url_tpex_old, headers=headers, timeout=10)
+            data2 = safe_json(res2)
+            tpex_data = data2.get("aaData", [])
+
+            for row in tpex_data:
+                # 標準格式: [1]代號, [2]名稱, [4]處置起訖, [5]處置措施
+                if not (isinstance(row, list) and len(row) >= 6):
+                    continue
+
                 code = str(row[1]).strip()
-                # ✅ 修正 2: 增加四碼檢查
-                if not (code.isdigit() and len(code) == 4): continue
+                if not (code.isdigit() and len(code) == 4):
+                    continue
 
                 raw_name = str(row[2]).strip()
                 period = str(row[4]).strip()
@@ -387,13 +428,13 @@ def fetch_all_disposition_stocks():
 
                 if is_active(period):
                     all_stock_list.append({
-                        '市場': '上櫃', 
-                        '代號': code, 
-                        '名稱': clean_tpex_name(raw_name), 
-                        '處置期間': period, 
-                        '處置措施': clean_tpex_measure(raw_content)
+                        "市場": "上櫃",
+                        "代號": code,
+                        "名稱": clean_tpex_name(raw_name),
+                        "處置期間": period,
+                        "處置措施": clean_tpex_measure(raw_content),
                     })
-            except: continue
+
     except Exception as e:
         st.error(f"TPEx 處置股抓取失敗: {e}")
 
