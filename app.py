@@ -286,37 +286,45 @@ def get_today_date():
     # 強制使用台灣時間，確保換日邏輯一致
     return datetime.now(ZoneInfo("Asia/Taipei")).date()
 
-def parse_roc_date(roc_date_str):
-    try:
-        roc_date_str = str(roc_date_str).strip()
-        parts = re.split(r'[/-]', roc_date_str)
-        if len(parts) == 3:
-            return date(int(parts[0])+1911, int(parts[1]), int(parts[2]))
-    except: return None
-    return None
+def extract_dates_any(s: str):
+    s = str(s or "").strip()
+
+    # 1) 114/12/25、114-12-25、2025.12.25
+    p1 = re.findall(r'(\d{2,4})[./-](\d{1,2})[./-](\d{1,2})', s)
+
+    # 2) 114年12月25日（可無日）
+    p2 = re.findall(r'(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?', s)
+
+    hits = p1 + p2
+    dates = []
+    for y, m, d in hits:
+        try:
+            y = int(y); m = int(m); d = int(d)
+            # 年份判斷：小於 1911 視為民國年；否則視為西元年
+            if y < 1911:
+                y += 1911
+            dates.append(date(y, m, d))
+        except:
+            pass
+    return dates
 
 def is_active(period_str):
-    if not period_str:
-        return False
+    """
+    回傳：
+    - True  : 今日在處置區間內
+    - False : 今日不在處置區間內
+    - None  : 解析不到區間（避免把整批 TPEx 全濾掉）
+    """
+    ds = extract_dates_any(period_str)
+    if len(ds) < 2:
+        return None
 
-    s = str(period_str).strip()
+    start, end = ds[0], ds[1]
+    if start > end:
+        start, end = end, start
 
-    # 抓出字串中前兩個「民國日期」(例如 114/12/25 或 114-12-25)
-    m = re.findall(r'(\d{2,3})[/-](\d{1,2})[/-](\d{1,2})', s)
-    if len(m) < 2:
-        return False
-
-    def roc_to_date(t):
-        y, mo, d = map(int, t)
-        return date(y + 1911, mo, d)
-
-    try:
-        start = roc_to_date(m[0])
-        end = roc_to_date(m[1])
-        today = get_today_date()
-        return start <= today <= end
-    except:
-        return False
+    today = get_today_date()
+    return start <= today <= end
 
 def clean_tpex_name(raw_name):
     return raw_name.split('(')[0] if '(' in raw_name else raw_name
@@ -344,6 +352,18 @@ def safe_json(res):
     except Exception:
         return json.loads(res.text.lstrip("\ufeff").strip())
 
+def pick_4digit_code_from_values(obj):
+    # obj 可以是 dict 或 list
+    vals = obj.values() if isinstance(obj, dict) else obj
+    for v in vals:
+        t = re.sub(r'<[^>]+>', '', str(v)).strip()  # 去 HTML
+        if re.fullmatch(r'\d{4}', t):
+            return t
+    return ""
+
+def clean_text(x):
+    return re.sub(r'<[^>]+>', '', str(x)).replace("&nbsp;", " ").strip()
+
 @st.cache_data(ttl=300)
 def fetch_all_disposition_stocks():
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -368,7 +388,9 @@ def fetch_all_disposition_stocks():
                 
                 measure = "20分鐘盤" if any(k in raw_measure for k in ["第二次","再次"]) else "5分鐘盤"
                 
-                if is_active(period):
+                # is_active 回傳 True/False/None，只要不是 False 都當作有效 (None保留)
+                active = is_active(period)
+                if active is not False:
                     all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
         else:
             st.error(f"TWSE 回傳非 200: {res.status_code}\n{res.text[:200]}")
@@ -393,26 +415,54 @@ def fetch_all_disposition_stocks():
             payload = []
 
         for item in payload:
-            code = str(item.get("SecuritiesCompanyCode", "")).strip()
+            # ✅ key 名可能不同：先吃常見 key，再不行就從 values 撿 4 碼代號
+            code = clean_text(
+                item.get("SecuritiesCompanyCode")
+                or item.get("證券代號")
+                or item.get("代號")
+                or ""
+            )
+            if not code:
+                code = pick_4digit_code_from_values(item)
+
             if not (code.isdigit() and len(code) == 4):
                 continue
 
-            name = str(item.get("CompanyName", "")).strip()
-            period = str(item.get("DispositionPeriod", "")).strip()
+            name = clean_text(
+                item.get("CompanyName")
+                or item.get("證券名稱")
+                or item.get("名稱")
+                or ""
+            )
 
-            # 有些欄位名稱會因版本不同而有內容差異，這裡做保險
-            reason = str(item.get("DispositionReasons", "")).strip()
-            cond = str(item.get("DisposalCondition", "")).strip()
-            raw_content = (cond or reason)
+            period = clean_text(
+                item.get("DispositionPeriod")
+                or item.get("處置期間")
+                or item.get("處置起迄")
+                or ""
+            )
 
-            if is_active(period):
-                all_stock_list.append({
-                    "市場": "上櫃",
-                    "代號": code,
-                    "名稱": clean_tpex_name(name),
-                    "處置期間": period,
-                    "處置措施": clean_tpex_measure(raw_content),
-                })
+            raw_content = clean_text(
+                item.get("DisposalCondition")
+                or item.get("DispositionReasons")
+                or item.get("處置措施")
+                or item.get("處置內容")
+                or ""
+            )
+
+            active = is_active(period)
+
+            # ✅ 關鍵：解析不到日期(None)不要直接丟掉，否則 TPEx 很容易全空
+            if active is False:
+                continue
+
+            all_stock_list.append({
+                "市場": "上櫃",
+                "代號": code,
+                "名稱": clean_tpex_name(name) if name else "",
+                "處置期間": period,
+                "處置措施": clean_tpex_measure(raw_content),
+            })
 
         # ✅ 若 OpenAPI 端點回來是空（被擋/格式變），再用你本來 aaData 的舊端點備援
         if len([x for x in all_stock_list if x.get("市場") == "上櫃"]) == 0:
@@ -426,26 +476,44 @@ def fetch_all_disposition_stocks():
             tpex_data = data2.get("aaData", [])
 
             for row in tpex_data:
-                # 標準格式: [1]代號, [2]名稱, [4]處置起訖, [5]處置措施
-                if not (isinstance(row, list) and len(row) >= 6):
+                if not isinstance(row, list) or len(row) == 0:
                     continue
 
-                code = str(row[1]).strip()
-                if not (code.isdigit() and len(code) == 4):
+                cells = [clean_text(x) for x in row]
+
+                code = next((c for c in cells if re.fullmatch(r"\d{4}", c)), "")
+                if not code:
                     continue
 
-                raw_name = str(row[2]).strip()
-                period = str(row[4]).strip()
-                raw_content = str(row[5]).strip()
+                # 名稱：找第一個「不是代號、不是日期區間」的字串
+                name = ""
+                for c in cells:
+                    if not c or c == code:
+                        continue
+                    if len(extract_dates_any(c)) >= 2:
+                        continue
+                    name = c
+                    break
 
-                if is_active(period):
-                    all_stock_list.append({
-                        "市場": "上櫃",
-                        "代號": code,
-                        "名稱": clean_tpex_name(raw_name),
-                        "處置期間": period,
-                        "處置措施": clean_tpex_measure(raw_content),
-                    })
+                # 期間：找包含至少 2 個日期的 cell
+                period = next((c for c in cells if len(extract_dates_any(c)) >= 2), "")
+
+                # 措施：找含「分鐘」或「分盤」字樣
+                raw_content = next((c for c in cells if ("分鐘" in c) or ("分盤" in c)), "")
+                if not raw_content:
+                    raw_content = " ".join(cells)
+
+                active = is_active(period)
+                if active is False:
+                    continue
+
+                all_stock_list.append({
+                    "市場": "上櫃",
+                    "代號": code,
+                    "名稱": clean_tpex_name(name) if name else "",
+                    "處置期間": period,
+                    "處置措施": clean_tpex_measure(raw_content),
+                })
 
     except Exception as e:
         st.error(f"TPEx 處置股抓取失敗: {e}")
