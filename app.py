@@ -294,8 +294,11 @@ def extract_dates_any(s: str):
 
     # 2) 114年12月25日（可無日）
     p2 = re.findall(r'(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?', s)
+    
+    # 3) 1141223 (7碼純數字，TPEx 常見格式)
+    p3 = re.findall(r'(\d{3})(\d{2})(\d{2})', s)
 
-    hits = p1 + p2
+    hits = p1 + p2 + p3
     dates = []
     for y, m, d in hits:
         try:
@@ -307,6 +310,19 @@ def extract_dates_any(s: str):
         except:
             pass
     return dates
+
+def format_roc_period(period_str):
+    """將解析到的日期格式化為 114/MM/DD～114/MM/DD"""
+    dates = extract_dates_any(period_str)
+    if len(dates) >= 2:
+        start, end = dates[0], dates[1]
+        # 確保順序
+        if start > end: start, end = end, start
+        
+        s_str = f"{start.year - 1911}/{start.month:02d}/{start.day:02d}"
+        e_str = f"{end.year - 1911}/{end.month:02d}/{end.day:02d}"
+        return f"{s_str}～{e_str}"
+    return period_str
 
 def is_active(period_str):
     """
@@ -391,7 +407,8 @@ def fetch_all_disposition_stocks():
                 # is_active 回傳 True/False/None，只要不是 False 都當作有效 (None保留)
                 active = is_active(period)
                 if active is not False:
-                    all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': period, '處置措施': measure})
+                    # 上市通常已經格式好了，但也可以套用一下統一格式
+                    all_stock_list.append({'市場': '上市', '代號': code, '名稱': name, '處置期間': format_roc_period(period), '處置措施': measure})
         else:
             st.error(f"TWSE 回傳非 200: {res.status_code}\n{res.text[:200]}")
     except Exception as e:
@@ -435,12 +452,15 @@ def fetch_all_disposition_stocks():
                 or ""
             )
 
-            period = clean_text(
+            # 抓取原始字串 (可能是 1141223 這種格式)
+            period_raw = clean_text(
                 item.get("DispositionPeriod")
                 or item.get("處置期間")
                 or item.get("處置起迄")
                 or ""
             )
+            # 統一格式化
+            period = format_roc_period(period_raw)
 
             raw_content = clean_text(
                 item.get("DisposalCondition")
@@ -450,7 +470,7 @@ def fetch_all_disposition_stocks():
                 or ""
             )
 
-            active = is_active(period)
+            active = is_active(period_raw)
 
             # ✅ 關鍵：解析不到日期(None)不要直接丟掉，否則 TPEx 很容易全空
             if active is False:
@@ -496,14 +516,15 @@ def fetch_all_disposition_stocks():
                     break
 
                 # 期間：找包含至少 2 個日期的 cell
-                period = next((c for c in cells if len(extract_dates_any(c)) >= 2), "")
+                period_raw = next((c for c in cells if len(extract_dates_any(c)) >= 2), "")
+                period = format_roc_period(period_raw)
 
                 # 措施：找含「分鐘」或「分盤」字樣
                 raw_content = next((c for c in cells if ("分鐘" in c) or ("分盤" in c)), "")
                 if not raw_content:
                     raw_content = " ".join(cells)
 
-                active = is_active(period)
+                active = is_active(period_raw)
                 if active is False:
                     continue
 
