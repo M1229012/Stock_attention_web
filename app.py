@@ -15,6 +15,7 @@ import urllib3
 from datetime import datetime, date
 from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
+from requests.exceptions import SSLError
 
 # 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -324,7 +325,18 @@ def clean_tpex_measure(content):
     if any(k in content for k in ["第二次", "再次", "每20分鐘", "每25分鐘", "每60分鐘"]): return "20分鐘盤"
     return "5分鐘盤"
 
-@st.cache_data(ttl=3600)
+def safe_get(url, headers=None, timeout=10):
+    """
+    先用 verify=True 嘗試；若遇到 Streamlit Cloud 常見的 SSLCertVerificationError，
+    則 fallback 到 verify=False 以確保能抓到公開資料。
+    """
+    try:
+        return requests.get(url, headers=headers, timeout=timeout)  # 預設 verify=True
+    except SSLError as e:
+        st.warning(f"⚠️ SSL 驗證失敗，改用 verify=False 抓取：{e}")
+        return requests.get(url, headers=headers, timeout=timeout, verify=False)
+
+@st.cache_data(ttl=300)
 def fetch_all_disposition_stocks():
     headers = {'User-Agent': 'Mozilla/5.0'}
     all_stock_list = []
@@ -332,7 +344,9 @@ def fetch_all_disposition_stocks():
     # 1. 上市 (TWSE) - 移除 verify=False，使用標準流程
     try:
         url_twse = "https://openapi.twse.com.tw/v1/announcement/punish"
-        res = requests.get(url_twse, headers=headers, timeout=10)
+        # 使用 safe_get
+        res = safe_get(url_twse, headers=headers, timeout=10)
+        
         if res.status_code == 200:
             for item in res.json():
                 code = item.get('Code', '').strip()
@@ -353,7 +367,8 @@ def fetch_all_disposition_stocks():
     # 2. 上櫃 (TPEx) - 移除 verify=False，移除 len>=8 模糊猜測，改回標準索引
     try:
         url_tpex = "https://www.tpex.org.tw/web/bulletin/disposal_information/disposal_information_result.php?l=zh-tw&o=json"
-        res = requests.get(url_tpex, headers=headers, timeout=10)
+        # 使用 safe_get
+        res = safe_get(url_tpex, headers=headers, timeout=10)
         data = res.json()
         
         # 鎖定讀取 aaData，並使用固定索引 (確保跟本地邏輯一樣)
